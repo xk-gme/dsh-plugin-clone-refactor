@@ -1521,14 +1521,16 @@ describe('reconcile', () => {
     expect(result).toEqual({ unauthorized: [], missing: [] })
   })
 
+  // 参数顺序是 (authorized, changed)：这里两处曾把顺序写反，导致断言要求的
+  // 恰是数据所否定的东西（"授权 b 然后断言 b 未授权"），计划已修正。
   it('flags a changed file the ledger never authorized', () => {
-    const result = reconcile(['src/a.cpp', 'module/laws/src/b.cpp'], ['src/a.cpp'])
+    const result = reconcile(['src/a.cpp'], ['src/a.cpp', 'module/laws/src/b.cpp'])
     expect(result.unauthorized).toEqual(['module/laws/src/b.cpp'])
     expect(result.missing).toEqual([])
   })
 
   it('flags an authorized file that is not actually changed', () => {
-    const result = reconcile(['src/a.cpp'], ['src/a.cpp', 'src/gone.cpp'])
+    const result = reconcile(['src/a.cpp', 'src/gone.cpp'], ['src/a.cpp'])
     expect(result.unauthorized).toEqual([])
     expect(result.missing).toEqual(['src/gone.cpp'])
   })
