@@ -2584,9 +2584,8 @@ export function pythonDetector(): CloneDetector {
       await ensureDir(paths.detectionDir)
       const argv = buildDetectionArgv({ settings, module: target, outputRoot: paths.detectionDir })
       const result = await runner.run({
-        argv, cwd: settings.projectRoot,
-        timeoutMs: settings.verify.steps.length > 0 ? 3_600_000 : 3_600_000,
-        signal,
+        // 一个模块的克隆检测是长活：60 分钟上限，与 brief 的 `agent_timeout_seconds` 同量级。
+        argv, cwd: settings.projectRoot, timeoutMs: 3_600_000, signal,
       })
       // Keep the invocation next to its output, with the API key redacted: the
       // run directory is the only durable record of what produced these clusters.
