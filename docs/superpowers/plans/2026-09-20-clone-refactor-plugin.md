@@ -3398,6 +3398,26 @@ describe('renderReport', () => {
     expect(text).toMatch(/C002/)
   })
 
+  it('groups clusters by priority, not by the order the ledger happens to hold them', () => {
+    // The discriminating case: the P0 cluster has the *greater* id, so an implementation
+    // that merely preserved ledger order (or sorted by id) would put C001 first and fail.
+    const clusters: Cluster[] = [
+      { ...CLUSTERS[1]!, id: 'C001' },
+      { ...CLUSTERS[0]!, id: 'C002' },
+    ]
+    const text = renderReport(input({
+      clusters,
+      assessments: new Map([
+        ['C001', { ...assessment('C001', 'report_only'), priority: 'P2' }],
+        ['C002', { ...assessment('C002', 'report_only'), priority: 'P0' }],
+      ]),
+    }))
+    expect(text).toContain('### P0（1）')
+    expect(text).toContain('### P2（1）')
+    expect(text.indexOf('### P0')).toBeLessThan(text.indexOf('### P2'))
+    expect(text.indexOf('`C002`')).toBeLessThan(text.indexOf('`C001`'))
+  })
+
   it('names the configured steps that did not run, so a skip cannot read as a smaller pipeline', () => {
     const verify: VerifyResult = {
       attempt: 1, ok: false, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
@@ -3503,6 +3523,7 @@ export function summarize(input: SummaryInput): Summary {
  */
 import { createHash } from 'node:crypto'
 import { writeAtomic, type RunPaths } from '../core/artifacts.ts'
+import { PRIORITIES } from '../config.ts'
 import type { Assessment, Cluster, PatchRecord, VerifyResult } from '../core/schema.ts'
 import type { RunRecord } from '../core/run.ts'
 import type { JobRecord } from '../core/jobs.ts'
@@ -3589,8 +3610,25 @@ export function renderReport(input: ReportInput): string {
   if (input.run.baseline.dirty.length > 0) {
     lines.push('## 基线不干净 / Dirty baseline', '', '- 开跑时工作区已有改动（`workdir.allowDirty` 已开启）：', ...input.run.baseline.dirty.map(file => `  - \`${file}\``), '')
   }
-  lines.push('## 簇与判定 / Clusters', '', '| 簇 | 优先级 | 判定 | 对数 | 代表对 | 理由 |', '|---|---|---|---|---|---|',
-    ...input.clusters.map(cluster => clusterLine(cluster, input.assessments.get(cluster.id))), '')
+  // 按优先级分组（spec §11："按优先级分组的簇"）。一张平铺表会把 P0 埋在 P2 中间，而报告
+  // 的第一用途就是让人先看到最该看的那些。未判定的簇单独成组，免得与"已评估为 PX"混同。
+  lines.push('## 簇与判定 / Clusters', '')
+  const groups: Array<{ title: string; clusters: Cluster[] }> = [
+    ...PRIORITIES.map(priority => ({
+      title: priority,
+      clusters: input.clusters.filter(cluster => input.assessments.get(cluster.id)?.priority === priority),
+    })),
+    {
+      title: '未判定 / no verdict',
+      clusters: input.clusters.filter(cluster => input.assessments.get(cluster.id) === undefined),
+    },
+  ]
+  for (const group of groups) {
+    if (group.clusters.length === 0) continue
+    lines.push(`### ${group.title}（${group.clusters.length}）`, '',
+      '| 簇 | 优先级 | 判定 | 对数 | 代表对 | 理由 |', '|---|---|---|---|---|---|',
+      ...group.clusters.map(cluster => clusterLine(cluster, input.assessments.get(cluster.id))), '')
+  }
   if (gaps.length > 0) {
     lines.push('## 覆盖缺口 / Coverage gaps', '', ...gaps.map(id => `- \`${id}\` 没有判定`), '')
   }
