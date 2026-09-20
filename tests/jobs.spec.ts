@@ -36,6 +36,20 @@ describe('job records', () => {
     expect(await latestJob(await paths())).toBeUndefined()
     expect(await loadJob(await paths(), 'nope')).toBeUndefined()
   })
+
+  it('reports the newest job by start time, then by id', async () => {
+    const target = await paths()
+    const older = await startJob(target, 'run-1', 'scan', new Date('2026-09-20T01:00:00Z'))
+    const newer = await startJob(target, 'run-1', 'verify', new Date('2026-09-20T02:00:00Z'))
+    expect((await latestJob(target))?.job_id).toBe(newer.job_id)
+
+    // Two jobs that started in the same second are ordered by id, not by write order.
+    const sameSecond = new Date('2026-09-20T03:00:00Z')
+    const first = await startJob(target, 'run-1', 'scan', sameSecond)
+    const second = await startJob(target, 'run-1', 'verify', sameSecond)
+    const expected = [first.job_id, second.job_id, older.job_id].sort().at(-1)
+    expect((await latestJob(target))?.job_id).toBe(expected)
+  })
 })
 
 describe('detach', () => {
