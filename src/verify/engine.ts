@@ -36,7 +36,7 @@ export function logFileFor(paths: RunPaths, attempt: number, index: number, name
   return join(paths.verifyDir, String(attempt), `${index}-${safe}.log`)
 }
 
-function renderLog(step: VerifyStep, result: StepResult, cwd: string, stdout: string, stderr: string, spillPath: string | null): string {
+function renderLog(step: VerifyStep, result: StepResult, cwd: string, stdout: string, stderr: string, spillPath: string | null, signal: string | null): string {
   const lines = [
     `step: ${step.name}`,
     `phase: ${step.phase}`,
@@ -45,7 +45,11 @@ function renderLog(step: VerifyStep, result: StepResult, cwd: string, stdout: st
     `required: ${String(step.required)}`,
     `always: ${String(step.always)}`,
     `exit_code: ${String(result.exit_code)}`,
-    `signal: ${result.exit_code === null ? 'killed or never started' : 'none'}`,
+    // The runner's own signal — never an inference from a null exit code. A command
+    // that never started reports EXIT_NOT_RUN (-1), not null, so "null means it never
+    // started" would be a false statement inside the one artifact that *is* the
+    // evidence. StepResult has no field for the signal, so this line is its only home.
+    `signal: ${signal ?? (result.exit_code === null ? 'unknown' : 'none')}`,
     `timed_out: ${String(result.timed_out)}`,
     `lossy: ${String(result.lossy)}`,
   ]
@@ -86,7 +90,7 @@ export async function runVerification(options: EngineOptions): Promise<VerifyRes
       lossy: result.lossy,
     }
     await mkdir(attemptDir, { recursive: true })
-    await writeFile(stepResult.log_file, renderLog(step, stepResult, options.cwd, result.stdout, result.stderr, result.spillPath), 'utf8')
+    await writeFile(stepResult.log_file, renderLog(step, stepResult, options.cwd, result.stdout, result.stderr, result.spillPath, result.signal), 'utf8')
     results.push(stepResult)
     // Only a required step can fail the run: an optional step that fails is
     // bookkeeping, not evidence about the patch. An `always` step that fails is
@@ -96,6 +100,10 @@ export async function runVerification(options: EngineOptions): Promise<VerifyRes
   }
   return {
     attempt: options.attempt,
+    // Vacuous truth by design: with no configured steps nothing required failed, so
+    // `ok` is true. A caller that reads `ok` as "this patch was verified" MUST
+    // therefore refuse an empty step list itself — Task 13's clone_verify does — and
+    // the test below pins this vacuity so it stays a decision rather than a surprise.
     ok: !results.some(result => result.required && !result.ok),
     started_at: startedAt,
     finished_at: now().toISOString(),

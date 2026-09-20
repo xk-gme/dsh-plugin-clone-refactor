@@ -91,11 +91,43 @@ describe('runVerification', () => {
     expect(log).toContain('spill: D:/spill.txt')
   })
 
+  it('records the runner\'s real signal in the log instead of guessing from the exit code', async () => {
+    const target = await paths()
+    const runner = fakeRunner([['slow.exe', { exitCode: null, signal: 'SIGTERM', timedOut: true }]])
+    await runVerification({ runner, paths: target, attempt: 1, cwd: 'D:/repo', signal: undefined, steps: [step('slow', 'slow.exe')] })
+    const log = await readFile(join(target.verifyDir, '1', '1-slow.log'), 'utf8')
+    // The signal the runner reported, not an inference: a killed step must not read
+    // as "killed or never started", and a never-started step carries EXIT_NOT_RUN.
+    expect(log).toContain('signal: SIGTERM')
+    expect(log).not.toContain('killed or never started')
+  })
+
+  it('says so plainly when there was no signal at all', async () => {
+    const target = await paths()
+    const runner = fakeRunner([['ok.exe', {}]])
+    await runVerification({ runner, paths: target, attempt: 1, cwd: 'D:/repo', signal: undefined, steps: [step('ok', 'ok.exe')] })
+    expect(await readFile(join(target.verifyDir, '1', '1-ok.log'), 'utf8')).toContain('signal: none')
+  })
+
+  it('reports ok for an empty step list, and this test exists so no caller reads that as verified', async () => {
+    const target = await paths()
+    const runner = fakeRunner([])
+    const result = await runVerification({ runner, paths: target, attempt: 1, cwd: 'D:/repo', signal: undefined, steps: [] })
+    // Nothing required failed, so `ok` is vacuously true and nothing ran at all. The
+    // enforcement lives in the caller (Task 13 refuses an empty step list); pinning it
+    // here keeps the vacuity visible instead of letting it look like a real pass.
+    expect(result.ok).toBe(true)
+    expect(result.steps).toEqual([])
+    expect(runner.calls).toEqual([])
+  })
+
   it('runs the steps in a caller-supplied work directory', async () => {
     const target = await paths()
     const runner = fakeRunner([['msbuild', {}]])
-    await runVerification({ runner, paths: target, attempt: 1, cwd: 'D:/repo', signal: undefined, steps: [step('build', 'msbuild x.sln')] })
+    await runVerification({ runner, paths: target, attempt: 1, cwd: 'D:/repo', signal: undefined, steps: [step('build', 'msbuild tests.sln')] })
     expect(runner.calls[0]?.cwd).toBe('D:/repo')
+    // The configured command string must actually reach the runner as argv.
+    expect(runner.calls[0]?.argv).toEqual(['msbuild', 'tests.sln'])
   })
 })
 
