@@ -2286,7 +2286,7 @@ function representativeOf(pairs: readonly Pair[]): Pair {
   })
 }
 
-/** Group CSV records into clone families, in first-appearance order with P-prefixed ids. */
+/** Group CSV records into clone families, in first-appearance order with C-prefixed ids. */
 export function clustersFromRecords(records: ReadonlyArray<Record<string, string>>): Cluster[] {
   const pairs = pairsFrom(records)
   return components(pairs).map((group, index) => {
@@ -2307,7 +2307,7 @@ export function clustersFromRecords(records: ReadonlyArray<Record<string, string
         right: representative.right,
       },
       files: [...new Set([...nodes.values()].map(node => node.file))].sort(),
-      functions: [...new Set([...nodes.values()].map(node => node.function).filter(name => name !== ''))].sort(),
+      functions: [...new Set([...nodes.values()].map(node => node.func).filter(name => name !== ''))].sort(),
     }
   })
 }
