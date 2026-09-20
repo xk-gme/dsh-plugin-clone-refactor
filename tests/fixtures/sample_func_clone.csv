@@ -1,0 +1,5 @@
+pair_id,Path1,Function1,line_range1,file2,func2_name,lines2,similarity,detection_method,code1,code2
+p1,module/laws/src/a.cpp,ComputeArea,"10-20",module/laws/src/b.cpp,CalcArea,"30-40",0.95,type12,"int x, y;","int u, v;"
+p2,module/laws/src/b.cpp,CalcArea,"30-40",module/laws/src/c.cpp,AreaHelper,"50-60",0.88,type34,"int u, v;","double scale;"
+p3,module\laws\src\z.cpp,Orphan,"70-80",module/laws/src/y.cpp,Orphan2,"90-100",0.4,type12,,
+p4,module/laws/src/a.cpp,ComputeArea,"10-20",module/laws/src/c.cpp,AreaHelper,"50-60",0.99,type34,"int x, y;","""quoted, value"""
