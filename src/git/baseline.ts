@@ -82,8 +82,13 @@ function assertTrustworthy(result: CommandResult, context: string): void {
  * one that finishes exactly as the deadline fires. Treating that as success would
  * let `checkoutFiles` record `rolled_back: true`, and `createBranch` report a
  * branch it never created, over a command that may not have completed.
+ *
+ * Exported because the same fact has two more call sites: `submit.ts` runs four
+ * outward commands (`git add`, `git commit`, `git push`, `gh pr create`) and
+ * `detect/python.ts` starts the detection pipeline. Both judge their child the
+ * same way, so the guard lives in one place rather than being copied.
  */
-function assertCompleted(result: CommandResult, context: string): void {
+export function assertCompleted(result: CommandResult, context: string): void {
   if (result.exitCode === 0 && !result.timedOut) return
   if (result.timedOut) {
     throw new Error(`${context}: the command was cut off by its timeout (exit ${String(result.exitCode)})`)

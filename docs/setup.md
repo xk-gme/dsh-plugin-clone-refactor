@@ -283,8 +283,10 @@ Clustering here is structural: it does not port the Python pipeline's body-skele
 
 **Rollback.** When an attempt fails, `verify.keepFailedPatch` is false, at least one file is authorized, and the run's baseline was clean, the plugin rolls the authorized files back to the baseline — in two parts, because the files are not all the same kind:
 
-- files git tracks are restored with `git restore --source=HEAD --staged --worktree -- <files>`;
-- files this run **created** are removed with `git clean -f -- <files>` (no `-x`, so files you had ignored are never touched).
+- files git tracks are restored with `git --literal-pathspecs restore --source=HEAD --staged --worktree -- <files>`;
+- files this run **created** are removed with `git --literal-pathspecs clean -f -- <files>` (no `-x`, so files you had ignored are never touched).
+
+`--literal-pathspecs` is deliberate hardening: the names come from the ledger's `files_changed`, and git would otherwise read a metacharacter in one of them as a pathspec pattern — a `*` in a ledger path would widen the command to the whole repository. The flag makes git treat every name literally.
 
 Only `files_changed` from the authorization ledger is ever named, so the blast radius is exactly the set the user approved. If any part of the rollback fails it throws, and the failure is visible in the job record and the report — the report never claims a rollback that did not happen. The plugin never runs `git reset --hard`.
 

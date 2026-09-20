@@ -6,6 +6,7 @@
  */
 import type { SubmitMode } from './config.ts'
 import type { CommandRunner } from './core/command.ts'
+import { assertCompleted } from './git/baseline.ts'
 
 export interface SubmitInput {
   runner: CommandRunner
@@ -47,12 +48,33 @@ export function renderCommitMessage(template: string, values: Record<string, str
 
 async function run(input: SubmitInput, argv: readonly string[], steps: string[]): Promise<string> {
   const result = await input.runner.run({ argv, cwd: input.projectRoot, timeoutMs: 600_000, signal: input.signal })
-  if (result.exitCode !== 0) {
-    const detail = (result.stderr.trim() || result.stdout.trim() || `exit ${String(result.exitCode)}`).slice(0, 1000)
-    throw new Error(`${argv.join(' ')} failed: ${detail}`)
-  }
+  // The shared MUTATING-command guard, not a bare `exitCode !== 0` check: a child
+  // that traps SIGTERM, or one that finishes exactly as our deadline fires, settles
+  // as `{ exitCode: 0, timedOut: true }` (see `tests/command.spec.ts:157`). Without
+  // this, all four steps below were recorded as successful outward actions over a
+  // command that may never have completed. `lossy` stays exempt: the stdout here is
+  // only a log line, which the guard documents.
+  assertCompleted(result, `${argv.join(' ')} failed`)
   steps.push(argv.join(' '))
   return result.stdout.trim()
+}
+
+/**
+ * Refuse to submit from a branch that is not the run's own.
+ *
+ * The whole authorization story is bound to `record.branch`: `clone_verify`
+ * reconciles against it and `git push origin <run branch>` pushes it. A manual
+ * switch between verify and submit would commit the patch on whichever branch HEAD
+ * happens to point at, while the push sends a stale ref — an outward action on
+ * work nobody reviewed in the place it was reviewed.
+ */
+async function assertOnRunBranch(input: SubmitInput): Promise<void> {
+  const result = await input.runner.run({ argv: ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd: input.projectRoot, timeoutMs: 60_000, signal: input.signal })
+  assertCompleted(result, `Cannot read the current branch of ${input.projectRoot}`)
+  const current = result.stdout.trim()
+  if (current !== input.branch) {
+    throw new Error(`HEAD is on '${current}', not on this run's branch '${input.branch}'. Switch back (git checkout ${input.branch}) before submitting: otherwise the commit would land on the wrong branch.`)
+  }
 }
 
 /** Commit, then push, then open a PR — as far as `mode` allows. */
@@ -61,6 +83,7 @@ export async function submit(input: SubmitInput): Promise<SubmitResult> {
   const result: SubmitResult = { mode: input.mode, committed: false, pushed: false, pr_url: null, steps }
   if (input.mode === 'none') return result
   if (input.files.length === 0) throw new Error('Cannot commit: no authorized files. Record a patched verdict with files_changed first.')
+  await assertOnRunBranch(input)
   await run(input, ['git', 'add', '--', ...input.files], steps)
   await run(input, ['git', 'commit', '-m', input.message], steps)
   result.committed = true

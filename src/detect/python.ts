@@ -11,6 +11,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Settings } from '../config.ts'
 import { ensureDir } from '../core/artifacts.ts'
+import { assertCompleted } from '../git/baseline.ts'
 import { clustersFromRecords, hasCloneColumns, parseCsv, recordsOf } from './cluster.ts'
 import type { CloneDetector, DetectInput, DetectResult } from './provider.ts'
 
@@ -101,9 +102,27 @@ export function pythonDetector(): CloneDetector {
         redactText(`${redactArgv(argv, secrets).join(' ')}\nexit=${String(result.exitCode)}\n\n${result.stdout}\n${result.stderr}`, secrets),
         'utf8',
       )
-      if (result.exitCode !== 0) {
+      if (result.exitCode !== 0 || result.timedOut) {
+        // The shared MUTATING/started-command guard, not a bare `exitCode` check:
+        // `{ exitCode: 0, timedOut: true }` is reachable (see the comment on
+        // `assertCompleted` and `tests/command.spec.ts:157`), and the pipeline writes
+        // its merged CSV incrementally — a child killed at its deadline that exits 0
+        // leaves a PARTIAL csv, which would be parsed and reported as a complete
+        // scan. That is a silent under-report of clone families.
+        //
+        // The guard is asked whether the command completed; its own message is NOT
+        // reused, because it embeds the raw stderr and this provider is the one that
+        // carries the embedding key on the child's argv. The refusal is rebuilt here
+        // from the redacted detail, distinguishing a timeout from a plain failure.
         const detail = redactText(result.stderr.trim() || result.stdout.trim() || `exit ${String(result.exitCode)}`, secrets).slice(0, 2000)
-        throw new Error(`The clone-detection pipeline failed (${detail})`)
+        try {
+          assertCompleted(result, 'The clone-detection pipeline')
+        } catch {
+          const reason = result.timedOut
+            ? `The clone-detection pipeline was cut off by its timeout (exit ${String(result.exitCode)})`
+            : 'The clone-detection pipeline failed'
+          throw new Error(`${reason} (${detail})`)
+        }
       }
       const csv = mergedCsvPath(paths.detectionDir, target)
       let text: string

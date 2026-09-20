@@ -26,17 +26,47 @@ export interface LedgerRead {
   droppedLines: number[]
 }
 
-/** Load every assessment; the newest record per cluster wins. */
-export async function loadAssessments(paths: RunPaths): Promise<LedgerRead> {
+/**
+ * Whether a record belongs to the scan revision being read.
+ *
+ * Cluster ids are positional (`src/detect/cluster.ts`: `C001`, `C002`, …) and a
+ * rescan rewrites `clusters.jsonl` wholesale, so `C001` can name a completely
+ * different family after a refresh. A verdict recorded under an older revision
+ * therefore must not satisfy the coverage contract of the new one: the closing
+ * report would pair the NEW cluster's files with the OLD cluster's verdict text
+ * and claim complete coverage.
+ *
+ * A record with no revision was written before revisions existed. It counts only
+ * while the run's clusters have no recorded revision either: once a scan has
+ * stamped a revision, such a record cannot be shown to speak about the current
+ * cluster set, so it does not count. Hiding it is the conservative direction —
+ * the run reports a coverage gap a human can resolve with one `clone_assess`,
+ * while the other direction closes the run on a verdict about a different family.
+ */
+export function seenAtRevision(record: { scan_revision?: string }, revision: string | undefined): boolean {
+  if (revision === undefined) return true
+  return record.scan_revision === revision
+}
+
+/**
+ * Load every assessment; the newest record per cluster wins.
+ *
+ * Passing the current scan `revision` restricts the read to the records of that
+ * revision, which is what the coverage contract needs after a refresh. Passing
+ * nothing reads the whole file, which is what `recordAssessment`'s
+ * replace-detection needs.
+ */
+export async function loadAssessments(paths: RunPaths, revision?: string): Promise<LedgerRead> {
   const { records, droppedLines } = await readJsonl<Assessment>(paths.assessments)
+  const history = records.filter(record => seenAtRevision(record, revision))
   const latest = new Map<string, Assessment>()
-  for (const record of records) {
+  for (const record of history) {
     if (typeof record?.cluster_id !== 'string' || record.cluster_id === '') continue
     // A later record always wins, including a `replace: true` correction.
     latest.delete(record.cluster_id)
     latest.set(record.cluster_id, record)
   }
-  return { latest, history: records, droppedLines }
+  return { latest, history, droppedLines }
 }
 
 /**
@@ -76,8 +106,9 @@ export async function recordAssessment(
 }
 
 /** The authorization ledger; a missing file is an empty ledger. */
-export async function loadPatches(paths: RunPaths): Promise<PatchRecord[]> {
-  return (await readJson<PatchRecord[]>(paths.patches)) ?? []
+export async function loadPatches(paths: RunPaths, revision?: string): Promise<PatchRecord[]> {
+  const patches = (await readJson<PatchRecord[]>(paths.patches)) ?? []
+  return revision === undefined ? patches : patches.filter(patch => seenAtRevision(patch, revision))
 }
 
 export async function savePatches(paths: RunPaths, patches: readonly PatchRecord[]): Promise<void> {

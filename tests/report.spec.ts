@@ -330,4 +330,31 @@ describe('writeReport', () => {
     expect(written.summary.missing).toBe(1)
     expect(await readFile(target.reportMd, 'utf8')).toMatch(/C002/)
   })
+
+  it('names the unauthorized files in a partial report instead of hiding them', async () => {
+    // Reachable exactly the way a reviewer's probe reached it: the run is frozen
+    // with UNAUTHORIZED_CHANGES, and `allow_partial: true` is the only way to close
+    // it. The section that names the file is then the whole point of the artifact —
+    // the file a human must resolve before the run can proceed.
+    const target = await paths()
+    const written = await writeReport(target, input({
+      assessments: new Map([['C001', assessment('C001', 'patched')]]),
+      unauthorized: ['module/laws/src/sneaky.cpp', 'module/laws/src/sneaky.cpp', 'module/laws/src/other.cpp'],
+      allowPartial: true,
+    }))
+    const report = await readFile(target.reportMd, 'utf8')
+    expect(report).toContain('## 未授权改动 / Unauthorized changes')
+    expect(report).toContain('`module/laws/src/sneaky.cpp`')
+    expect(report).toContain('`module/laws/src/other.cpp`')
+    // Deduplicated and sorted in the machine-readable half, so both halves agree.
+    expect(written.summary.unauthorized_files).toEqual(['module/laws/src/other.cpp', 'module/laws/src/sneaky.cpp'])
+    expect(JSON.parse(await readFile(target.summaryJson, 'utf8')).unauthorized_files)
+      .toEqual(['module/laws/src/other.cpp', 'module/laws/src/sneaky.cpp'])
+    // And a run with no unauthorized change must NOT carry the heading: an empty
+    // section would read as "something was reported here".
+    const clean = await writeReport(await paths(), input({
+      assessments: new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]]),
+    }))
+    expect(await readFile(clean.report_path, 'utf8')).not.toContain('未授权改动')
+  })
 })

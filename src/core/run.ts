@@ -64,6 +64,26 @@ function serializeRun(record: RunRecord): string {
   return `${JSON.stringify(persisted, null, 2)}\n`
 }
 
+/**
+ * Resume an EXISTING run, or fail naming the id.
+ *
+ * `openRun` does more than read: it reads the baseline and, when patching is
+ * authorized, runs `git checkout -B clone-refactor/<id>` in the user's checkout.
+ * Every tool except `clone_scan` must not create a run, so a mistyped `run_id`
+ * must not reach it — that is how a stray `clone_assess`, `clone_verify`,
+ * `clone_submit` or `clone_report` created a run, switched the user's branch and
+ * (for verify) started the build pipeline for a run that never existed.
+ */
+export async function requireRun(artifactsRoot: string, runId: string): Promise<OpenedRun> {
+  assertInsideRoot(artifactsRoot, runId)
+  const paths = runPaths(artifactsRoot, runId)
+  const record = await loadRun(paths)
+  if (record === undefined) {
+    throw new Error(`No run '${runId}' under ${artifactsRoot}. Call clone_scan first: only clone_scan may create a run.`)
+  }
+  return { record, paths, created: false }
+}
+
 export interface OpenRunOptions {
   settings: Settings
   runner: CommandRunner

@@ -283,8 +283,10 @@ node $dsh web
 
 **回滚。** 一次尝试失败、`verify.keepFailedPatch` 为假、至少有一个授权文件、且该 run 的基线干净时，插件把授权文件回滚到基线——分两部分做，因为这些文件并不都是同一类：
 
-- git 跟踪的文件用 `git restore --source=HEAD --staged --worktree -- <files>` 恢复；
-- 本次 run **新建**的文件用 `git clean -f -- <files>` 删除（不加 `-x`，因此你原本忽略的文件绝不会被动到）。
+- git 跟踪的文件用 `git --literal-pathspecs restore --source=HEAD --staged --worktree -- <files>` 恢复；
+- 本次 run **新建**的文件用 `git --literal-pathspecs clean -f -- <files>` 删除（不加 `-x`，因此你原本忽略的文件绝不会被动到）。
+
+`--literal-pathspecs` 是有意的加固：文件名来自账本的 `files_changed`，git 否则会把其中一个元字符当成 pathspec 通配——账本路径里一个 `*` 就会把命令放大到整个仓库。这个标志让 git 把每个名字都当字面量。
 
 被点名的文件只来自授权账本的 `files_changed`，所以爆炸半径正好是用户批准过的那一批。回滚任一步失败都会抛错，失败会体现在 job 记录与报告里——报告绝不会声称一次并未发生的回滚。插件永不执行 `git reset --hard`。
 

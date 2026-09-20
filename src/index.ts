@@ -57,7 +57,7 @@ export function guidanceText(settings: Settings, configured: boolean): string {
       '       projectRoot: <absolute path to the GME checkout>',
       '       artifactsRoot: <run directory>   # optional',
       '2. Decide the detection source: detection.provider: csv with detection.csvPath pointing at an existing func_clone_<module>.csv (no Python needed), or detection.provider: python-pipeline with detection.scriptPath pointing at docs/.codex/skills/cpp-clone-detection/scripts/run_gme_clone_detection.py (needs Python, libclang and, for type 3-4, an embeddings endpoint).',
-      '3. Patching source is off by default. To allow one authorized P0 patch per run, set authorization.enabled: true (authorization.maxPriority, authorization.maxClusters).',
+      '3. Patching source is off by default. To allow source changes, set authorization.enabled: true. authorization.maxPriority is the severity ceiling, and authorization.maxClusters caps how many clusters may hold LIVE authorization at the same time — it is not a count of patches over the run\'s life, so retracting a verdict frees a slot.',
       '4. clone_verify needs verify.steps: the build, test, format and restore commands for this site. Without them nothing can be verified and nothing may be submitted.',
       '5. Submissions are off by default (submit.mode: none); commit, push or pr must be chosen deliberately.',
       'Report these steps when the user asks for a clone refactor or asks why its tools are missing.',

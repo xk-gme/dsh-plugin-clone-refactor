@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import Tools from '@deepseek-ai/dsh-tools'
-import { apply, resolveSettings } from '../src/index.ts'
+import { apply, guidanceText, resolveSettings } from '../src/index.ts'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -103,6 +103,19 @@ function configurationSection(text: string): string {
   return end === -1 ? rest : rest.slice(0, end)
 }
 
+/**
+ * A file name, not a key path: the section legitimately writes
+ * `run_gme_clone_detection.py` and `report.md`, and both are dotted backticked
+ * tokens that name no settings key. Only extensions the docs actually use are
+ * excluded, so `workdir.returnToOriginalBranch` — the dead key this check exists
+ * for — still counts as a key path.
+ */
+const FILE_EXTENSIONS = ['py', 'md', 'json', 'jsonl', 'csv', 'yml', 'yaml', 'ts', 'js', 'txt', 'log']
+
+function looksLikeAFileName(token: string): boolean {
+  return FILE_EXTENSIONS.some(extension => token.endsWith(`.${extension}`))
+}
+
 describe('the tool table in the two READMEs', () => {
   it('names exactly the clone_* tools the plugin registers, in English and in Chinese', async () => {
     const registered = await registeredToolNames()
@@ -113,6 +126,39 @@ describe('the tool table in the two READMEs', () => {
       const named = mentionedToolNames(await readFile(join(ROOT, file), 'utf8'))
       expect(named, `${file} must name exactly the registered clone_* tools`).toEqual(registered)
     }
+  })
+
+  it('keeps one row per tool in each README table, not merely a mention in prose', async () => {
+    // The whole-document scan above cannot see a DELETED row: the name survives in
+    // that README's prose, so the file still names every tool. A Tools table that
+    // lost a row is exactly the drift this contract exists to catch, so the row set
+    // is compared separately.
+    const registered = await registeredToolNames()
+    for (const file of ['README.md', 'README.zh.md']) {
+      const text = await readFile(join(ROOT, file), 'utf8')
+      const rows = [...new Set(text.split('\n')
+        .map(line => /^\|\s*`(clone_[a-z][a-z0-9_]*)`\s*\|/.exec(line)?.[1])
+        .filter((name): name is string => name !== undefined))]
+        .sort()
+      // A row scan that matched nothing must fail loudly rather than prove the
+      // absence of unexpected rows.
+      expect(rows.length, `${file} has no clone_* tool table rows at all`).toBeGreaterThan(0)
+      expect(rows, `${file}'s tool table must have one row per registered tool`).toEqual(registered)
+    }
+  })
+})
+
+describe('the model-facing guidance', () => {
+  it('does not overstate the authorization cap as one patch per run', async () => {
+    // README.md, README.zh.md, docs/setup.md and docs/setup.zh.md were all corrected
+    // for this: `authorization.maxClusters` caps LIVE authorizations, and retracting
+    // a verdict frees a slot. The numbered setup steps are the branch a model reads
+    // when the plugin is not configured yet, and it says the same thing.
+    const { settings } = resolveSettings({})
+    const text = guidanceText(settings, false)
+    expect(text).not.toMatch(/one authorized P0 patch per run/i)
+    expect(text).toMatch(/LIVE/)
+    expect(text).toMatch(/retracting a verdict frees a slot/i)
   })
 })
 
@@ -149,15 +195,38 @@ describe('the configuration reference in the two setup docs', () => {
     // code path in the release. Every row whose first cell is a single backticked key
     // is compared against what the resolver actually produces.
     const known = new Set<string>([...required, ...stepFields])
+    // The shape of a configuration table row. The counts below are what the two
+    // docs' tables are supposed to have (26 keys + 6 step fields); a positive control
+    // is what keeps "no row matched" from passing as "no dead key found".
+    const rowShape = /^\|\s*`([A-Za-z][A-Za-z0-9_.[\]]*)`\s*\|/
+    const expectedRows = known.size
     for (const file of ['docs/setup.md', 'docs/setup.zh.md']) {
       const section = configurationSection(await readFile(join(ROOT, file), 'utf8'))
       // A section this check cannot locate would make the assertion below vacuous.
       expect(section.length, `${file} has no configuration-reference section to check`).toBeGreaterThan(0)
-      const claimed = [...new Set(section.split('\n')
-        .map(line => /^\|\s*`([A-Za-z][A-Za-z0-9_.[\]]*)`\s*\|/.exec(line)?.[1])
-        .filter((key): key is string => key !== undefined))]
-        .filter(key => !known.has(key))
+      const candidateRows = section.split('\n')
+        .map(line => rowShape.exec(line)?.[1])
+        .filter((key): key is string => key !== undefined)
+      // The reverse direction, over the rows just counted: the set is what makes a
+      // candidate row's key have to be real. This runs before the count control so a
+      // dead key is reported as the dead key it is, not merely as an extra row.
+      const claimed = candidateRows.filter(key => !known.has(key))
       expect(claimed, `${file} documents keys resolveSettings() does not produce: ${claimed.join(', ')}`).toEqual([])
+      // A positive control, not a threshold: the tables of both docs hold exactly one
+      // row per settings key, so a mutation that removes rows, or a section that
+      // stops parsing, fails here instead of silently matching nothing.
+      expect(candidateRows.length, `${file}: the configuration tables must have one row per settings key`).toBe(expectedRows)
+      expect(new Set(candidateRows).size, `${file}: a configuration table row is duplicated`).toBe(expectedRows)
+      // The same key written as prose rather than a table row still names a
+      // configuration key, so a DOTTED backticked token anywhere in the section must
+      // be a table row (or a known key). A plain single-word token is deliberately
+      // out of scope: the section legitimately writes `csv`, `ok`, `zh`, `none` and
+      // step phases in its prose, and those are not key paths.
+      const rows = new Set(candidateRows)
+      const stray = [...new Set([...section.matchAll(/`([A-Za-z][A-Za-z0-9_]*\.[A-Za-z0-9_.[\]]*)`/g)]
+        .map(match => match[1] as string))]
+        .filter(key => !rows.has(key) && !known.has(key) && !looksLikeAFileName(key))
+      expect(stray, `${file} mentions dotted keys outside its configuration tables: ${stray.join(', ')}`).toEqual([])
     }
   })
 })

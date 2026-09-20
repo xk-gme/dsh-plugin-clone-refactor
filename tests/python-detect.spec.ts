@@ -111,6 +111,45 @@ describe('pythonDetector', () => {
       .rejects.toThrow(/libclang/)
   })
 
+  it('refuses a scan whose command was cut off by its timeout, instead of parsing a partial CSV', async () => {
+    // `{ exitCode: 0, timedOut: true }` is reachable (tests/command.spec.ts:157):
+    // a child that traps SIGTERM, or one that finishes exactly as our deadline
+    // fires. The pipeline writes its merged CSV incrementally, so a killed child
+    // leaving a partial (or empty) file must not be read as a complete scan — that
+    // is a silent under-report of clone families.
+    const dir = await workspace()
+    const paths = runPaths(dir, 'r1')
+    const settings = resolveSettings({ projectRoot: 'D:/gme', detection: { pythonPath: 'py.exe', scriptPath: 'D:/agent/run.py' } }).settings
+    await mkdir(join(paths.detectionDir, 'base'), { recursive: true })
+    await writeFile(join(paths.detectionDir, 'base', 'func_clone_base.csv'),
+      'pair_id,file1,func1_name,lines1,file2,func2_name,lines2,similarity\np1,a.cpp,f,1-2,b.cpp,g,3-4,0.9\n')
+    const runner = fakeRunner([['py.exe', { exitCode: 0, timedOut: true, stdout: 'partial\n' }]])
+    const error = await pythonDetector().detect({ settings, runner, paths, module: 'base', csvPath: '', signal: undefined })
+      .then(() => undefined, (caught: unknown) => caught as Error)
+    expect(error?.message).toMatch(/cut off by its timeout/)
+    // Distinguishable from a plain non-zero exit, which reports the pipeline's own log.
+    expect(error?.message).not.toMatch(/exited 1|exit 1/)
+    // The invocation is still recorded, so the operator can see what ran.
+    expect(await readFile(join(paths.detectionDir, 'detect-command.txt'), 'utf8')).toContain('exit=0')
+  })
+
+  it('keeps the API key out of the timeout refusal too', async () => {
+    const dir = await workspace()
+    const paths = runPaths(dir, 'r1')
+    const settings = resolveSettings({
+      projectRoot: 'D:/gme',
+      detection: {
+        pythonPath: 'py.exe', scriptPath: 'D:/agent/run.py',
+        enableType34: true, embeddingApiKey: 'secret-key',
+      },
+    }).settings
+    const runner = fakeRunner([['py.exe', { exitCode: 0, timedOut: true, stderr: 'fatal with secret-key\n' }]])
+    const error = await pythonDetector().detect({ settings, runner, paths, module: 'base', csvPath: '', signal: undefined })
+      .then(() => undefined, (caught: unknown) => caught as Error)
+    expect(error?.message).toContain('[redacted]')
+    expect(error?.message).not.toContain('secret-key')
+  })
+
   it('fails when the pipeline reports success but wrote no CSV', async () => {
     const dir = await workspace()
     const paths = runPaths(dir, 'r1')

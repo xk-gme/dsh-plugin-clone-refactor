@@ -338,6 +338,55 @@ describe('clone_assess authorization rules', () => {
     expect(rendered(assessed)).toMatch(/evidence/)
   })
 
+  it('enforces authorization.maxClusters across clusters and frees the slot on retraction', async () => {
+    // The cap counts LIVE authorizations, so the discriminating case is a second
+    // cluster: a rule written as "one patch per run" and a rule written as "at most
+    // maxClusters live records" agree at one item and disagree at two.
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}`
+      + 'p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n'
+      + 'p2,module/laws/src/c.cpp,DrawShape,50-60,module/laws/src/d.cpp,PaintShape,70-80,0.9,type12\n')
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true, maxClusters: 1 },
+    }, fakeRunner([['git checkout -B', { stdout: '' }], ...GIT_OK]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+
+    const patched = (clusterId: string) => call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: clusterId, verdict: 'patched', priority: 'P0',
+      reason: 'bodies are identical', files_changed: ['module/laws/src/a.cpp'],
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+
+    const first = await patched('C001')
+    expect((first as { isError?: boolean }).isError, rendered(first)).not.toBe(true)
+    expect(await loadPatchesOf(root)).toHaveLength(1)
+
+    const second = await patched('C002')
+    expect((second as { isError?: boolean }).isError, rendered(second)).toBe(true)
+    expect(rendered(second)).toMatch(/maxClusters is 1/)
+    expect(await loadPatchesOf(root)).toHaveLength(1)
+
+    // Retracting C001 frees the slot: the cap is on live records, not on patches
+    // made over the run's life. Without the retraction this same call must fail,
+    // which is what the assertion above pins.
+    const retracted = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'skipped', priority: 'PX',
+      reason: 'on reflection this one is out of scope', replace: true,
+    })
+    expect((retracted as { isError?: boolean }).isError, rendered(retracted)).not.toBe(true)
+    expect(await loadPatchesOf(root)).toHaveLength(0)
+
+    const afterRetraction = await patched('C002')
+    expect((afterRetraction as { isError?: boolean }).isError, rendered(afterRetraction)).not.toBe(true)
+    expect(await loadPatchesOf(root)).toHaveLength(1)
+  })
+
   it('rejects an unknown cluster id and lists what it does know', async () => {
     const root = await workspace()
     const csv = join(root, 'func_clone_base.csv')
@@ -348,6 +397,121 @@ describe('clone_assess authorization rules', () => {
     const assessed = await call(ctx, 'clone_assess', { run_id: 'r1', cluster_id: 'C999', verdict: 'skipped', priority: 'PX', reason: 'nope' })
     expect((assessed as { isError?: boolean }).isError).toBe(true)
     expect(rendered(assessed)).toMatch(/C001/)
+  })
+})
+
+describe('the non-scan tools never create a run', () => {
+  // `openRun` creates a run AND — with authorization.enabled — runs
+  // `git checkout -B clone-refactor/<id>` in the user's checkout. Only `clone_scan`
+  // may do that. A mistyped `run_id` reaching any other tool used to create a run
+  // and switch the user's branch, so every one of them must fail instead.
+  const UNKNOWN = 'ghost'
+
+  it('refuses clone_assess on an unknown run_id, creating no run.json and no branch', async () => {
+    const root = await workspace()
+    const runner = fakeRunner([['git checkout -B', { stdout: '' }], ...GIT_OK])
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      authorization: { enabled: true },
+    }, runner)
+    const assessed = await call(ctx, 'clone_assess', {
+      run_id: UNKNOWN, cluster_id: 'C001', verdict: 'skipped', priority: 'PX', reason: 'mistyped id',
+    })
+    expect((assessed as { isError?: boolean }).isError).toBe(true)
+    expect(rendered(assessed)).toMatch(new RegExp(`No run '${UNKNOWN}'`))
+    expect(JSON.stringify(assessed)).not.toMatch(/Unknown cluster_id/)
+    // Both halves, per tool: no run directory record, and no branch switch.
+    await expect(readFile(join(root, 'runs', UNKNOWN, 'run.json'), 'utf8')).rejects.toThrow()
+    expect(gitVerbsOf(runner)).not.toContain('checkout')
+  })
+
+  it('refuses clone_verify on an unknown run_id, creating no run.json and no branch', async () => {
+    const root = await workspace()
+    const runner = fakeRunner([['git checkout -B', { stdout: '' }], ...GIT_OK])
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      authorization: { enabled: true },
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
+    }, runner)
+    const verified = await call(ctx, 'clone_verify', { run_id: UNKNOWN })
+    expect((verified as { isError?: boolean }).isError).toBe(true)
+    expect(rendered(verified)).toMatch(new RegExp(`No run '${UNKNOWN}'`))
+    // The reproduced bug returned accepted:true and started the build pipeline in
+    // the user's checkout for a run that never existed.
+    expect(JSON.stringify(verified)).not.toMatch(/"accepted":true/)
+    await expect(readFile(join(root, 'runs', UNKNOWN, 'run.json'), 'utf8')).rejects.toThrow()
+    expect(gitVerbsOf(runner)).not.toContain('checkout')
+  })
+
+  it('refuses clone_submit on an unknown run_id, creating no run.json and no branch', async () => {
+    // Code-confirmed in the review, not probed: the same `openRun` call path.
+    const root = await workspace()
+    const runner = fakeRunner([['git checkout -B', { stdout: '' }], ...GIT_OK])
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      authorization: { enabled: true },
+      submit: { mode: 'commit' },
+    }, runner)
+    const submitted = await call(ctx, 'clone_submit', { run_id: UNKNOWN, confirm: true })
+    expect((submitted as { isError?: boolean }).isError).toBe(true)
+    expect(rendered(submitted)).toMatch(new RegExp(`No run '${UNKNOWN}'`))
+    await expect(readFile(join(root, 'runs', UNKNOWN, 'run.json'), 'utf8')).rejects.toThrow()
+    expect(gitVerbsOf(runner)).not.toContain('checkout')
+    expect(gitVerbsOf(runner)).not.toContain('commit')
+  })
+
+  it('refuses clone_report on an unknown run_id, creating no run.json and no branch', async () => {
+    const root = await workspace()
+    const runner = fakeRunner([['git checkout -B', { stdout: '' }], ...GIT_OK])
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      authorization: { enabled: true },
+    }, runner)
+    const reported = await call(ctx, 'clone_report', { run_id: UNKNOWN })
+    expect((reported as { isError?: boolean }).isError).toBe(true)
+    expect(rendered(reported)).toMatch(new RegExp(`No run '${UNKNOWN}'`))
+    // The reproduced bug wrote report.md / findings.json / summary.json for a
+    // nonexistent run and returned isError: false.
+    await expect(readFile(join(root, 'runs', UNKNOWN, 'run.json'), 'utf8')).rejects.toThrow()
+    expect(gitVerbsOf(runner)).not.toContain('checkout')
+  })
+})
+
+describe('a refresh rescan cannot reuse an earlier revision\'s verdicts', () => {
+  it('does not close a refreshed run whose clusters changed', async () => {
+    const root = await workspace()
+    const csvA = join(root, 'func_clone_base.csv')
+    const csvB = join(root, 'func_clone_base_v2.csv')
+    await writeFile(csvA, `${CSV_HEADER}p1,a.cpp,f,1-2,b.cpp,g,3-4,0.9,type12\n`)
+    await writeFile(csvB, `${CSV_HEADER}p9,x.cpp,f,1-2,y.cpp,g,3-4,0.9,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csvA },
+    }, fakeRunner(GIT_OK))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    const assessed = await call(ctx, 'clone_assess', { run_id: 'r1', cluster_id: 'C001', verdict: 'skipped', priority: 'PX', reason: 'old cluster, not this one' })
+    expect((assessed as { isError?: boolean }).isError, rendered(assessed)).not.toBe(true)
+
+    // The same positional id C001 now names a completely different family.
+    const rescanned = await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base', csv_path: csvB, refresh: true })
+    expect((rescanned as { isError?: boolean }).isError, rendered(rescanned)).not.toBe(true)
+    await settle(ctx, 'r1')
+
+    // The coverage contract must not be satisfied by the old cluster's verdict.
+    const page = JSON.parse(rendered(await call(ctx, 'clone_check', { run_id: 'r1', what: 'clusters' }))) as { gaps: string[] }
+    expect(page.gaps).toEqual(['C001'])
+
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError).toBe(true)
+    expect(rendered(reported)).toMatch(/no verdict/)
+    const summary = JSON.parse(rendered(await call(ctx, 'clone_check', { run_id: 'r1', what: 'ledger' }))) as { assessments: unknown[] }
+    expect(summary.assessments).toEqual([])
   })
 })
 
@@ -427,10 +591,15 @@ describe('clone_check', () => {
 describe('clone_submit', () => {
   it('refuses to act without confirm: true', async () => {
     const root = await workspace()
-    const ctx = await mount({ projectRoot: 'D:/repo', artifactsRoot: join(root, 'runs') }, fakeRunner(GIT_OK))
+    const runner = fakeRunner(GIT_OK)
+    const ctx = await mount({ projectRoot: 'D:/repo', artifactsRoot: join(root, 'runs') }, runner)
     const submitted = await call(ctx, 'clone_submit', { run_id: 'r1' })
     expect((submitted as { isError?: boolean }).isError).toBe(true)
     expect(rendered(submitted)).toMatch(/confirm/)
+    // The other half of the gate: the refusal is not merely a message. Nothing
+    // outward may have been attempted, which its sibling test below asserts for the
+    // empty-ledger path and this one must assert for the consent path.
+    expect(gitVerbsOf(runner)).not.toContain('commit')
   })
 
   it('has nothing to submit when the authorization ledger is empty', async () => {
@@ -460,7 +629,18 @@ describe('clone_submit', () => {
 describe('clone_verify', () => {
   it('refuses an empty step list instead of reporting a vacuous pass', async () => {
     const root = await workspace()
-    const ctx = await mount({ projectRoot: 'D:/repo', artifactsRoot: join(root, 'runs') }, fakeRunner(GIT_OK))
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,a.cpp,f,1-2,b.cpp,g,3-4,0.9,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+    }, fakeRunner(GIT_OK))
+    // A run must exist first: since the A1 fix an unknown run_id is refused before
+    // any of this tool's own gates, so the empty-step refusal is only reachable on
+    // a real run.
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
     const verified = await call(ctx, 'clone_verify', { run_id: 'r1' })
     expect((verified as { isError?: boolean }).isError).toBe(true)
     // The engine reports ok: true for zero steps, and clone_submit reads that as a
@@ -906,6 +1086,15 @@ describe('the whole chain', () => {
     const summary = JSON.parse(await readFile(summaryPath, 'utf8')) as { clusters: number; missing: number; verify_ok: boolean }
     expect(summary.clusters).toBe(2)
     expect(summary.missing).toBe(0)
+    // The engine computes `ok` as "no EXECUTED required step failed", which is true
+    // for zero executed steps, so `verify_ok` alone cannot say the pipeline ran. The
+    // attempt's own record is the evidence: both configured steps, in order, with
+    // the command each one ran.
+    const attempt = JSON.parse(await readFile(join(root, 'runs', 'r1', 'verify', '1', 'result.json'), 'utf8')) as {
+      ok: boolean; steps: Array<{ name: string, command: string }>
+    }
+    expect(attempt.steps.map(step => step.name)).toEqual(['build', 'test'])
+    expect(attempt.steps.map(step => step.command)).toEqual(['msbuild tests.sln', 'tests.exe'])
     expect(summary.verify_ok).toBe(true)
     expect(await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')).toContain('msbuild tests.sln')
   })

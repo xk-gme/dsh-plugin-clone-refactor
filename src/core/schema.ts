@@ -38,6 +38,13 @@ export interface Assessment {
   reason: string
   files_changed: string[]
   recorded_at: string
+  /**
+   * The scan revision this verdict was recorded against. Cluster ids are
+   * positional, so after a refresh a verdict from an earlier revision must not
+   * satisfy the coverage contract of the new cluster set (see `seenAtRevision`).
+   * Absent only on records written before revisions existed.
+   */
+  scan_revision?: string
 }
 
 /** The authorization ledger: what the user allowed, and what it touched. */
@@ -46,6 +53,8 @@ export interface PatchRecord {
   priority: Priority
   files_changed: string[]
   recorded_at: string
+  /** The scan revision this authorization belongs to; see {@link Assessment.scan_revision}. */
+  scan_revision?: string
 }
 
 export interface StepResult {

@@ -4,12 +4,13 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { join } from 'node:path'
 import { PRIORITIES, PRIORITY_RANK, type Settings } from './config.ts'
-import { assertInsideRoot, runPaths, writeAtomic } from './core/artifacts.ts'
-import { loadJsonlClusters, saveJsonlClusters } from './core/clusters.ts'
+import { writeAtomic } from './core/artifacts.ts'
+import { loadJsonlClusters, loadScanRevision, saveJsonlClusters } from './core/clusters.ts'
 import { coverageGaps, loadAssessments, loadPatches, recordAssessment, savePatches } from './core/ledger.ts'
 import { detach, latestJob, startJob, type PersistFailure } from './core/jobs.ts'
 import { normalizePath } from './core/paths.ts'
-import { loadRun, openRun, saveRun } from './core/run.ts'
+import { newRunId } from './core/artifacts.ts'
+import { openRun, requireRun, saveRun } from './core/run.ts'
 import { requireText, VERDICTS, type Assessment, type PatchRecord } from './core/schema.ts'
 import { csvDetector } from './detect/csv.ts'
 import { pythonDetector } from './detect/python.ts'
@@ -69,6 +70,23 @@ function knownCluster(ids: readonly string[], requested: string): string {
 }
 
 /**
+ * One revision-consistent view of a run: the current cluster set, its revision,
+ * the verdicts and the authorizations that still count for it.
+ *
+ * A verdict (or authorization) recorded under an older revision is invisible to
+ * the coverage contract and to `clone_verify`: cluster ids are positional, so
+ * after a refresh `C001` can name a different family, and an old verdict would
+ * otherwise close the run while attributing its text to the wrong cluster.
+ */
+async function currentLedger(paths: import('./core/artifacts.ts').RunPaths) {
+  const revision = await loadScanRevision(paths)
+  const clusters = await loadJsonlClusters(paths)
+  const { latest, history, droppedLines } = await loadAssessments(paths, revision)
+  const patches = await loadPatches(paths, revision)
+  return { clusters, revision, latest, history, droppedLines, patches }
+}
+
+/**
  * The files the user authorized, in one spelling. Both `clone_verify` (what may
  * be reconciled) and `clone_submit` (what may be committed) must derive this the
  * same way, or a file the user authorized would look unauthorized to one of them.
@@ -103,17 +121,29 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       const detector = settings.detection.provider === 'python-pipeline' ? pythonDetector() : csvDetector()
       const runId = opened.record.run_id
       const paths = opened.paths
+      // A scan is a new REVISION of this run's coverage contract. Cluster ids are
+      // positional, so the ids alone cannot say whether a verdict still speaks
+      // about the same family: every scan gets a fresh revision, and a verdict or
+      // authorization from an older one stops counting (`seenAtRevision`). A scan
+      // that detects nothing still counts as a revision, which is what makes a
+      // previous verdict stop covering a now-empty cluster set.
+      const scanRevision = newRunId()
       // Detached on purpose: detection is minutes long, and the tool call must
       // return so the model can poll. The job record is the durable progress.
       const job = await startJob(paths, runId, 'scan')
       detach(paths, job, async () => {
         const detected = await detector.detect({ settings, runner, paths, module: args.module ?? '', csvPath: args.csv_path ?? '', signal: undefined })
-        await saveJsonlClusters(paths, detected.clusters)
+        await saveJsonlClusters(paths, detected.clusters, scanRevision)
         await saveRun(paths, { ...opened.record, detection_provider: detected.provider === 'python-pipeline' ? 'python-pipeline' : 'csv' })
         return detected
       }, detected => `${detected.clusters.length} cluster(s) via ${detected.provider}`, info => { reportPersistFailure(ctx, info) })
       return {
         run_id: runId, job_id: job.job_id, accepted: true, created: opened.created,
+        // The count at ACCEPT time, not the post-scan count: detection is the
+        // detached job `job_id` names, so the new cluster count does not exist yet
+        // when this returns. It is reported once the clusters are on disk — the job
+        // record's summary (`clone_check` with what: status) and `clone_check` with
+        // what: clusters. A refresh therefore reports the count it is replacing.
         clusters: existing.length, provider: detector.id,
         guidance: `Scanning "${args.module ?? ''}" with ${detector.id}. Poll clone_check with what: status until the job leaves running.`,
       }
@@ -135,11 +165,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       const runId = requireText(args.run_id, 'run_id')
       // A read-only tool must not create a run: `openRun` reads the baseline and
       // may switch branches, so it is a write. Inspect an existing run or fail.
-      assertInsideRoot(artifactsRoot, runId)
-      const paths = runPaths(artifactsRoot, runId)
-      if (await loadRun(paths) === undefined) {
-        throw new Error(`No run '${runId}' under ${artifactsRoot}. Call clone_scan first.`)
-      }
+      const { paths } = await requireRun(artifactsRoot, runId)
       if (args.what === 'status') {
         // `null`, never `undefined`: an absent key would vanish from the JSON the
         // model reads, and a poller could not tell "no job yet" from a lost field.
@@ -153,8 +179,8 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         return asJson({ run_id: runId, what: 'status', job: job ?? null, unreadable_jobs: unreadableJobs })
       }
       if (args.what === 'ledger') {
-        const { latest, droppedLines } = await loadAssessments(paths)
-        return asJson({ run_id: runId, what: 'ledger', assessments: [...latest.values()], patches: await loadPatches(paths), dropped_lines: droppedLines })
+        const { latest, droppedLines, patches } = await currentLedger(paths)
+        return asJson({ run_id: runId, what: 'ledger', assessments: [...latest.values()], patches, dropped_lines: droppedLines })
       }
       if (args.what === 'log') {
         const tail = await readNewestVerifyLog(paths, Math.max(1, args.log_lines ?? 80))
@@ -173,7 +199,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         page.push(cluster)
         characters += size
       }
-      const { latest } = await loadAssessments(paths)
+      const { latest } = await currentLedger(paths)
       return asJson({
         run_id: runId, what: 'clusters', total: clusters.length, offset,
         next_offset: offset + page.length < clusters.length ? offset + page.length : null,
@@ -207,8 +233,8 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
     async execute(args) {
       const runId = requireText(args.run_id, 'run_id')
       const clusterId = requireText(args.cluster_id, 'cluster_id')
-      const { paths, record } = await openRun({ settings, runner, artifactsRoot, runId })
-      const clusters = await loadJsonlClusters(paths)
+      const { paths, record } = await requireRun(artifactsRoot, runId)
+      const { clusters, patches: existingPatches, revision } = await currentLedger(paths)
       knownCluster(clusters.map(cluster => cluster.id), clusterId)
       const reason = requireText(args.reason, 'reason')
       const files = (args.files_changed ?? []).map(normalizePath).filter(Boolean)
@@ -230,9 +256,8 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         }
         if (files.length === 0) throw new Error('A patched verdict needs files_changed: the authorization ledger is what clone_verify reconciles against.')
         if (args.evidence === undefined) throw new Error('A patched verdict needs evidence: the file, line and snippet of the change.')
-        const patches = await loadPatches(paths)
-        if (!patches.some(patch => patch.cluster_id === clusterId) && patches.length >= authorization.maxClusters) {
-          throw new Error(`authorization.maxClusters is ${authorization.maxClusters}; this run already patched ${patches.length} cluster(s).`)
+        if (!existingPatches.some(patch => patch.cluster_id === clusterId) && existingPatches.length >= authorization.maxClusters) {
+          throw new Error(`authorization.maxClusters is ${authorization.maxClusters}; this run already patched ${existingPatches.length} cluster(s).`)
         }
       } else if (args.priority === 'P0' && args.evidence === undefined) {
         throw new Error('A P0 verdict that is not patched needs evidence of the concrete blocker (file, line, snippet). "Semantics unclear" is not evidence.')
@@ -240,6 +265,9 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       const assessment: Assessment = {
         cluster_id: clusterId, verdict: args.verdict, priority: args.priority, reason,
         files_changed: files, recorded_at: new Date().toISOString(),
+        // The revision this verdict speaks about. A later refresh changes the
+        // revision, which is what makes this verdict stop covering the new set.
+        ...(revision === undefined ? {} : { scan_revision: revision }),
       }
       const { replaced } = await recordAssessment(paths, assessment, { replace: args.replace === true })
       if (args.verdict === 'patched') {
@@ -249,10 +277,13 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         // UNAUTHORIZED_CHANGES that no further `clone_assess` could clear, and a
         // too-wide one would let `clone_submit` commit files nobody authorized.
         // The record keeps its position in the ledger so the ordering stays stable.
+        // An authorization from an older revision is dropped: it points at a
+        // family this scan revision no longer contains.
         const patches = await loadPatches(paths)
         const updated: PatchRecord = {
           cluster_id: clusterId, priority: args.priority,
           files_changed: files, recorded_at: assessment.recorded_at,
+          ...(revision === undefined ? {} : { scan_revision: revision }),
         }
         const existing = patches.findIndex(patch => patch.cluster_id === clusterId)
         await savePatches(paths, existing === -1
@@ -270,7 +301,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         const retained = patches.filter(patch => patch.cluster_id !== clusterId)
         if (retained.length !== patches.length) await savePatches(paths, retained)
       }
-      const { latest } = await loadAssessments(paths)
+      const { latest } = await currentLedger(paths)
       const covered = clusters.filter(cluster => latest.has(cluster.id)).length
       const remaining = clusters.length - covered
       return {
@@ -292,7 +323,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
     } }),
     async execute(args) {
       const runId = requireText(args.run_id, 'run_id')
-      const { paths, record } = await openRun({ settings, runner, artifactsRoot, runId })
+      const { paths, record } = await requireRun(artifactsRoot, runId)
       // An empty step list must never become a vacuous "verified": the engine reports
       // ok for zero steps (nothing required failed), and clone_submit reads that as a
       // passing verification. Refuse loudly here, before anything destructive can
@@ -301,7 +332,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       if (settings.verify.steps.length === 0) {
         throw new Error('verify.steps is empty, so nothing can be verified: configure this site\'s build/test steps before running clone_verify. An unverified patch must not be submitted.')
       }
-      const patches = await loadPatches(paths)
+      const { patches } = await currentLedger(paths)
       const authorized = authorizedFiles(patches)
       // One guarded read, in `git/baseline.ts`, for exactly this reconcile. The
       // authorization gate is only as good as the change set it reads: an
@@ -355,11 +386,11 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
     async execute(args) {
       const runId = requireText(args.run_id, 'run_id')
       if (args.confirm !== true) throw new Error('clone_submit requires confirm: true — get the user\'s explicit consent before any outward action.')
-      const { paths, record } = await openRun({ settings, runner, artifactsRoot, runId })
+      const { paths, record } = await requireRun(artifactsRoot, runId)
       const attempts = await loadVerifyAttempts(paths)
       const last = attempts.at(-1)
       if (last === undefined || !last.ok) throw new Error('No passing clone_verify for this run: nothing may be submitted before the build and tests pass.')
-      const patches = await loadPatches(paths)
+      const { patches } = await currentLedger(paths)
       const files = authorizedFiles(patches)
       if (files.length === 0) throw new Error('The authorization ledger is empty: there is nothing to submit.')
       const mode = (args.mode ?? settings.submit.mode) as Settings['submit']['mode']
@@ -391,11 +422,13 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
     } }),
     async execute(args) {
       const runId = requireText(args.run_id, 'run_id')
-      const { paths, record } = await openRun({ settings, runner, artifactsRoot, runId })
-      const clusters = await loadJsonlClusters(paths)
-      const { latest, droppedLines } = await loadAssessments(paths)
+      const { paths, record } = await requireRun(artifactsRoot, runId)
+      // One revision-consistent view of the run: the clusters, the verdicts and the
+      // authorizations must all belong to the same scan revision, or the closing
+      // report pairs a new cluster with an old cluster's verdict text.
+      const { clusters, latest, droppedLines, patches } = await currentLedger(paths)
       const written = await writeReport(paths, {
-        run: record, clusters, assessments: latest, patches: await loadPatches(paths),
+        run: record, clusters, assessments: latest, patches,
         verify: await loadVerifyAttempts(paths), job: await latestJob(paths), droppedLines,
         unauthorized: await loadUnauthorized(paths),
         notes: args.notes ?? '', allowPartial: args.allow_partial === true, language: settings.reportLanguage,
