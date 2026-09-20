@@ -1,5 +1,5 @@
 /** Where a run lives, and how its files are written. */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename as renameFile, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 
@@ -75,12 +75,78 @@ export async function ensureDir(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true })
 }
 
-/** Write through a temp file and rename, so a crash cannot leave a half artifact. */
+export interface RenameAttempt { (from: string, to: string): Promise<void> }
+
+/** Errnos a rename may hit while another handle holds the target. */
+const TRANSIENT_RENAME_CODES = new Set(['EPERM', 'EACCES', 'EBUSY'])
+
+/** 10 attempts, 5 ms doubling to a 320 ms cap: ~1.3 s of waiting in the worst case. */
+const RENAME_ATTEMPTS = 10
+const RENAME_BASE_DELAY_MS = 5
+const RENAME_MAX_DELAY_MS = 320
+
+/**
+ * Windows refuses to replace a file another handle has open, so a concurrent reader
+ * makes `rename` fail with EPERM/EACCES/EBUSY. Those are transient by nature: retry
+ * briefly, and only then let the error out.
+ *
+ * The delay is constant per attempt rather than held in a closure counter, so a
+ * rejected attempt cannot corrupt the next one's backoff. The rename and the sleep
+ * are injectable so a test can prove the retry policy without racing a real
+ * filesystem or waiting out the real backoff; the attempt count and the delays
+ * themselves are fixed, because this is a policy, not a knob.
+ */
+export async function renameWithRetry(
+  from: string,
+  to: string,
+  rename: RenameAttempt = renameFile,
+  sleep: (ms: number) => Promise<void> = ms => new Promise(resolve => setTimeout(resolve, ms)),
+): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(from, to)
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      // Anything but the transient set is a real error: report it, do not wait on it.
+      if (code === undefined || !TRANSIENT_RENAME_CODES.has(code)) throw error
+      if (attempt === RENAME_ATTEMPTS - 1) throw error
+      await sleep(Math.min(RENAME_BASE_DELAY_MS * 2 ** attempt, RENAME_MAX_DELAY_MS))
+    }
+  }
+}
+
+/**
+ * Makes each call's temp name distinct. Two writers aiming at one file used to
+ * share `<file>.tmp`, so the second could rename away the first's temp while the
+ * first was still writing it; the loser then failed with ENOENT on its own rename.
+ */
+let tempCounter = 0
+
+function tempPath(file: string): string {
+  tempCounter += 1
+  return `${file}.${process.pid}.${String(tempCounter)}.tmp`
+}
+
+/**
+ * Write through a temp file and rename, so a crash cannot leave a half artifact.
+ *
+ * The rename goes through `renameWithRetry`: a concurrent reader makes the plain
+ * rename fail on Windows, and a caller that swallowed that failure would leave the
+ * previous contents in place, which for a job record means a task that finished
+ * still reads as `running`. A failed write also removes its temp file, so a crash
+ * cannot leave debris for a later directory listing to mistake for a record.
+ */
 export async function writeAtomic(file: string, text: string): Promise<void> {
   await ensureDir(dirname(file))
-  const temp = `${file}.tmp`
-  await writeFile(temp, text, 'utf8')
-  await rename(temp, file)
+  const temp = tempPath(file)
+  try {
+    await writeFile(temp, text, 'utf8')
+    await renameWithRetry(temp, file)
+  } catch (error) {
+    await rm(temp, { force: true }).catch(() => undefined)
+    throw error
+  }
 }
 
 /** Parse a JSON file; a missing file is `undefined`, malformed JSON throws. */

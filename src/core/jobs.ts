@@ -31,6 +31,15 @@ export function newJobId(kind: JobKind, now: Date = new Date(), rand: () => numb
   return `${kind}-${stamp}-${Math.floor(rand() * 0x10000).toString(16).padStart(4, '0')}`
 }
 
+/** What a caller learns when a job's terminal status could not be written. */
+export interface PersistFailure {
+  job: JobRecord
+  /** The write error, never the task's own error. */
+  error: Error
+  /** What the stale record now claims, for a log line or a warning. */
+  note: string
+}
+
 function jobFile(paths: RunPaths, jobId: string): string {
   return join(paths.dir, 'jobs', `${jobId}.json`)
 }
@@ -94,17 +103,42 @@ export async function latestJob(paths: RunPaths): Promise<JobRecord | undefined>
  * Await one task under an existing job record, writing the terminal status in
  * both directions. `detach` reuses it, so success and failure are recorded by
  * exactly one code path.
+ *
+ * The record is written on a best-effort basis. If that write cannot land, the
+ * task's own outcome still stands and still decides whether this call resolves
+ * or rejects — a disk that refuses a bookkeeping update must not turn a
+ * successful scan into a failure. `onPersistFailure` is how the caller learns
+ * that the record now lies: the job stays `running` while its task has settled.
  */
-async function settle<T>(paths: RunPaths, job: JobRecord, task: () => Promise<T>, summarize?: (value: T) => string): Promise<T> {
+async function settle<T>(
+  paths: RunPaths,
+  job: JobRecord,
+  task: () => Promise<T>,
+  summarize?: (value: T) => string,
+  onPersistFailure?: (info: PersistFailure) => void,
+): Promise<T> {
+  let value: T
   try {
-    const value = await task()
-    await finishJob(paths, job, 'succeeded', null, summarize?.(value) ?? '')
-    return value
+    value = await task()
   } catch (error) {
     await finishJob(paths, job, 'failed', error instanceof Error ? error.message : String(error), '')
-      .catch(() => { /* best effort: the caller's log still carries the error */ })
+      .catch((writeError: unknown) => onPersistFailure?.({
+        job,
+        error: writeError instanceof Error ? writeError : new Error(String(writeError)),
+        note: 'the job stays running although its task failed',
+      }))
     throw error
   }
+  // Success is reported the same way: swallowing this would leave a finished
+  // job's on-disk record still claiming `running`, so a poller could not tell a
+  // settled task from an unsettled one.
+  await finishJob(paths, job, 'succeeded', null, summarize?.(value) ?? '')
+    .catch((writeError: unknown) => onPersistFailure?.({
+      job,
+      error: writeError instanceof Error ? writeError : new Error(String(writeError)),
+      note: 'the job stays running although its task succeeded',
+    }))
+  return value
 }
 
 /**
@@ -112,7 +146,25 @@ async function settle<T>(paths: RunPaths, job: JobRecord, task: () => Promise<T>
  * immediately. Every outcome — including a rejection — lands in the record,
  * because the tool call is over by the time it happens and `clone_check` is the
  * only thing that will ever look at it again.
+ *
+ * Best-effort contract, and its limits. `detach` returns `void` at the moment
+ * the work starts, so it cannot report a later persistence failure to the
+ * caller, and it never rejects: an unhandled rejection here would crash a
+ * process whose tool call already returned. It therefore swallows the task's
+ * rejection on purpose — that rejection is the task's normal failure signal and
+ * is already recorded as `failed`. What it does not swallow is the write of the
+ * terminal status: the optional `onPersistFailure` hook receives that error so
+ * the caller can put it somewhere durable. Without the hook the failure is
+ * dropped, and the on-disk record keeps claiming `running`; passing a hook is
+ * the difference between that and knowing why.
  */
-export function detach<T>(paths: RunPaths, job: JobRecord, task: () => Promise<T>, summarize?: (value: T) => string): void {
-  void settle(paths, job, task, summarize).catch(() => { /* recorded above */ })
+export function detach<T>(
+  paths: RunPaths,
+  job: JobRecord,
+  task: () => Promise<T>,
+  summarize?: (value: T) => string,
+  onPersistFailure?: (info: PersistFailure) => void,
+): void {
+  void settle(paths, job, task, summarize, onPersistFailure)
+    .catch(() => { /* the task's own rejection: recorded as failed above */ })
 }

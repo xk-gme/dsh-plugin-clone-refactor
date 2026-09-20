@@ -7,7 +7,7 @@ import { PRIORITIES, PRIORITY_RANK, type Settings } from './config.ts'
 import { assertInsideRoot, runPaths, writeAtomic } from './core/artifacts.ts'
 import { loadJsonlClusters, saveJsonlClusters } from './core/clusters.ts'
 import { coverageGaps, loadAssessments, loadPatches, recordAssessment, savePatches } from './core/ledger.ts'
-import { detach, latestJob, startJob } from './core/jobs.ts'
+import { detach, latestJob, startJob, type PersistFailure } from './core/jobs.ts'
 import { normalizePath } from './core/paths.ts'
 import { loadRun, openRun, saveRun } from './core/run.ts'
 import { requireText, VERDICTS, type Assessment, type PatchRecord } from './core/schema.ts'
@@ -28,6 +28,20 @@ const EVIDENCE = { type: 'object', additionalProperties: false, properties: {
 
 function output<S extends object>(schema: S) {
   return { schema, render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }] }
+}
+
+/**
+ * The one thing a detached job cannot tell the caller is that its terminal
+ * status never reached disk: the tool call that started it returned long ago.
+ * Logging it is what keeps the run honest — `clone_check` will otherwise keep
+ * reporting a job as running, and the operator needs to know the record, not the
+ * task, is what stalled.
+ */
+function reportPersistFailure(ctx: Context, info: PersistFailure): void {
+  ctx.logger.warn(
+    `gme-clone-refactor: job ${info.job.job_id} (${info.job.kind}) could not be persisted: `
+    + `${info.error.message}. ${info.note}; treat the on-disk record as stale and this job as settled.`,
+  )
 }
 
 /**
@@ -97,7 +111,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         await saveJsonlClusters(paths, detected.clusters)
         await saveRun(paths, { ...opened.record, detection_provider: detected.provider === 'python-pipeline' ? 'python-pipeline' : 'csv' })
         return detected
-      }, detected => `${detected.clusters.length} cluster(s) via ${detected.provider}`)
+      }, detected => `${detected.clusters.length} cluster(s) via ${detected.provider}`, info => { reportPersistFailure(ctx, info) })
       return {
         run_id: runId, job_id: job.job_id, accepted: true, created: opened.created,
         clusters: existing.length, provider: detector.id,
@@ -312,7 +326,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
           await writeAtomic(join(paths.verifyDir, String(attempt), 'result.json'), `${JSON.stringify(result, null, 2)}\n`)
         }
         return result
-      }, result => `attempt ${result.attempt}: ${result.ok ? 'PASS' : 'FAIL'}`)
+      }, result => `attempt ${result.attempt}: ${result.ok ? 'PASS' : 'FAIL'}`, info => { reportPersistFailure(ctx, info) })
       return { run_id: runId, job_id: job.job_id, accepted: true, attempt, authorized_files: authorized }
     },
     presentCall: args => ({ card: 'generic', title: 'Clone refactor', kind: 'other', rawInput: `verify ${args.run_id ?? ''}` }),
