@@ -963,9 +963,14 @@ describe('assessments', () => {
     await recordAssessment(target, assessment('C001', 'report_only'), { replace: false })
     await expect(recordAssessment(target, assessment('C001', 'skipped'), { replace: false }))
       .rejects.toThrow(/already has a verdict/)
+    // A refused verdict is not a record: the throw happens before the append, so
+    // only the accepted writes are in the ledger. On the `replace: true` below the
+    // history is 2, not 3 — 1 accepted + 1 refused (nothing written) + 1 replaced.
+    // The length-1 assertion is the one with teeth: it fails if a refusal appends.
+    expect((await loadAssessments(target)).history).toHaveLength(1)
     await recordAssessment(target, assessment('C001', 'patched', ['src/a.cpp']), { replace: true })
     const { latest, history } = await loadAssessments(target)
-    expect(history).toHaveLength(3)
+    expect(history).toHaveLength(2)
     expect(latest.get('C001')?.verdict).toBe('patched')
   })
 
