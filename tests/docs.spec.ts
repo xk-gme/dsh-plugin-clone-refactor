@@ -250,6 +250,9 @@ describe('the clone_check row in the two setup docs', () => {
       // result names too — prose that says "some records could not be read" without
       // the field is how the attempts half went missing in the first place.
       expect(row, `${file}'s clone_check row must name unreadable_jobs`).toContain('unreadable_jobs')
+      // The third durable record the same poll skips and names: the scan revision
+      // pointer, whose damage would otherwise have failed the poll outright.
+      expect(row, `${file}'s clone_check row must name unreadable_revision_pointer`).toContain('unreadable_revision_pointer')
     }
   })
 })
@@ -301,11 +304,23 @@ describe('the artifact field lists in the two setup docs', () => {
       notes: '', allowPartial: false, language: 'zh',
     })
     const summaryFields = Object.keys(JSON.parse(await readFile(pathsOfRun.summaryJson, 'utf8')) as object).sort()
-    const jobFields = Object.keys(await startJob(pathsOfRun, 'run-1', 'scan', new Date('2026-09-20T01:00:00Z'))).sort()
+    // BOTH job shapes, because one row documents both. Comparing the row against a
+    // SCAN record alone made the truthful field list fail: a scan writes no `attempt`,
+    // but every VERIFY record now carries the attempt it settled, so the row was left
+    // describing only half the records it names. The union is what the row has to
+    // document, and `attempt` is written as verify-only so a reader knows which shape
+    // carries it.
+    const scanJobFields = Object.keys(await startJob(pathsOfRun, 'run-1', 'scan', new Date('2026-09-20T01:00:00Z'))).sort()
+    const verifyJobFields = Object.keys(await startJob(pathsOfRun, 'run-1', 'verify', new Date('2026-09-20T02:00:00Z'), 1)).sort()
+    const jobFields = [...new Set([...scanJobFields, ...verifyJobFields])].sort()
     // Positive controls: an artifact that suddenly carried two fields would make the
     // comparisons below trivially true, so the lists have to stay the size they are.
+    // The verify shape is pinned as the scan shape plus exactly the attempt, so the
+    // union cannot silently collapse back to one shape.
     expect(summaryFields.length).toBeGreaterThan(15)
-    expect(jobFields.length).toBeGreaterThan(5)
+    expect(scanJobFields.length).toBeGreaterThan(5)
+    expect(verifyJobFields).toEqual([...scanJobFields, 'attempt'].sort())
+    expect(jobFields).toEqual(verifyJobFields)
 
     for (const file of ['docs/setup.md', 'docs/setup.zh.md']) {
       const text = await readFile(join(ROOT, file), 'utf8')

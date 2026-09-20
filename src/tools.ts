@@ -79,8 +79,11 @@ function knownCluster(ids: readonly string[], requested: string): string {
  * after a refresh `C001` can name a different family, and an old verdict would
  * otherwise close the run while attributing its text to the wrong cluster.
  */
-async function currentLedger(paths: import('./core/artifacts.ts').RunPaths) {
-  const revision = await loadScanRevision(paths)
+async function currentLedger(
+  paths: import('./core/artifacts.ts').RunPaths,
+  onUnreadable?: (name: string, error: Error) => void,
+) {
+  const revision = await loadScanRevision(paths, onUnreadable)
   const clusters = await loadJsonlClusters(paths)
   const { latest, history, droppedLines } = await loadAssessments(paths, revision)
   const patches = await loadPatches(paths, revision)
@@ -214,9 +217,19 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
           unreadableAttempts.push(name)
           ctx.logger.warn(`gme-clone-refactor: ignoring unreadable verification record ${name}: ${error.message}`)
         })
+        // The revision pointer is a durable record of the same class, and the same rule
+        // applies: a damaged one is skipped and named rather than making the only
+        // progress interface fail. Its damage is not silent either — the revision it
+        // would have named is unknown, so every stamped verdict stops counting.
+        const unreadableRevisionPointer: string[] = []
+        await loadScanRevision(paths, (name, error) => {
+          unreadableRevisionPointer.push(name)
+          ctx.logger.warn(`gme-clone-refactor: ignoring unreadable scan revision pointer ${name}: ${error.message}`)
+        })
         return asJson({
           run_id: runId, what: 'status', job: job ?? null,
           unreadable_jobs: unreadableJobs, unreadable_attempts: unreadableAttempts,
+          unreadable_revision_pointer: unreadableRevisionPointer,
         })
       }
       if (args.what === 'ledger') {
@@ -532,19 +545,21 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
     async execute(args) {
       const runId = requireText(args.run_id, 'run_id')
       const { paths, record } = await requireRun(artifactsRoot, runId)
-      // One revision-consistent view of the run: the clusters, the verdicts and the
-      // authorizations must all belong to the same scan revision, or the closing
-      // report pairs a new cluster with an old cluster's verdict text. `revision` is
-      // also one clause of the coverage claim below.
-      const { clusters, latest, droppedLines, patches, revision } = await currentLedger(paths)
       // Every durable record is read through the visible-skip hook: a corrupt file is
       // reported by name rather than dropped. Without it a corrupt NEWEST job record
-      // made this report present an older job as the run's last one.
+      // made this report present an older job as the run's last one — and a corrupt
+      // revision pointer made the report (and every other reader) fail outright.
       const unreadableRecords: string[] = []
       const noteUnreadable = (name: string, error: Error): void => {
         unreadableRecords.push(name)
         ctx.logger.warn(`gme-clone-refactor: ignoring unreadable record ${name}: ${error.message}`)
       }
+      // One revision-consistent view of the run: the clusters, the verdicts and the
+      // authorizations must all belong to the same scan revision, or the closing
+      // report pairs a new cluster with an old cluster's verdict text. `revision` is
+      // also one clause of the coverage claim below, and a damaged pointer is named
+      // through the hook above instead of failing the close.
+      const { clusters, latest, droppedLines, patches, revision } = await currentLedger(paths, noteUnreadable)
       const verify = await loadVerifyAttempts(paths, noteUnreadable)
       const job = await latestJob(paths, noteUnreadable)
       // The newest VERIFY job record, not `job`: the two are written on the same

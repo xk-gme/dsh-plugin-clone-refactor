@@ -209,6 +209,42 @@ function priorityText(byPriority: Record<string, number>): string {
   ].join(' / ')
 }
 
+/**
+ * The verify-job half of the submit gate's refusal, as a report section — or
+ * `undefined` when the newest verify job NAMES the newest attempt, which is the
+ * normal case.
+ *
+ * `newestVerifyOutcome` refuses when the newest VERIFY job record is missing or does
+ * not name the newest attempt (`JobRecord.attempt`): a terminal write that never
+ * landed leaves NO file for the job reader to miss, so the newest job left on disk is
+ * an EARLIER attempt's. The report could not say so, and this state is reachable
+ * without any tampering — every run verified before that field existed carries a
+ * `succeeded` verify record with no `attempt` on it. The report then published
+ * `验证 attempts: N（最新一次 ok: false）` next to a `## 最近的后台任务` line reading
+ * `verify-… (verify) → **succeeded**`, which is that earlier attempt's record, with
+ * nothing connecting the two — the exact shape the unreadable-records section exists
+ * to prevent.
+ */
+function verifyJobNote(input: ReportInput): string[] | undefined {
+  const newest = input.newestAttempt
+  if (newest === undefined) return undefined
+  const job = input.verifyJob
+  if (job !== undefined && job.attempt === newest) return undefined
+  const belongs = job === undefined
+    ? '本 run 没有最新的 verify job 记录'
+    : job.attempt === undefined
+      ? `磁盘上最新的 verify job 记录（\`${job.job_id}\`）没有记录它 settle 的是哪一次尝试（该字段出现之前写下的记录）`
+      : `磁盘上最新的 verify job 记录（\`${job.job_id}\`）属于 attempt ${String(job.attempt)}`
+  return [
+    '## 验证任务与最新尝试不符 / Verify job does not name the newest attempt',
+    '',
+    `- ${belongs}，所以最新一次验证（attempt ${String(newest)}）无法被证明成功：\`clone_submit\` 会拒绝提交。`,
+    '- `## 最近的后台任务 / Last job` 里的那一行不一定是这次尝试的记录：终态写盘失败不会留下可被发现的文件，磁盘上最新的一条就是较早一次尝试的；以上一条为准。',
+    `- 重新跑 \`clone_verify\`，让它为 attempt ${String(newest)} 写下自己的终态记录。`,
+    '',
+  ]
+}
+
 /** Render the human report. Pure: the same input always yields the same text. */
 export function renderReport(input: ReportInput): string {
   const summary = summarizeReport(input)
@@ -324,6 +360,14 @@ export function renderReport(input: ReportInput): string {
       `- 最新一次验证（attempt ${input.missingReconcileAttempt}）没有可读的 \`reconcile.json\`，所以本 run 既不能被判定为已冻结，也不能被判定为干净：\`clone_submit\` 会拒绝提交。重新跑 \`clone_verify\` 把这个记录写出来。`,
       `- 较早的 reconcile 记录（如果写过）仍在 \`verify/<n>/reconcile.json\` 下；本 run 的冻结判定只认最新一次。`,
       '')
+  }
+  // The second record the gate binds a submission to, named the same way. Emitted only
+  // when the report is not already explaining the refusal with a freeze claim: a frozen
+  // run's verification never started a job either, and that absence is a consequence of
+  // the freeze rather than the reason to refuse.
+  if (summary.unauthorized_files.length === 0 && input.missingReconcileAttempt === undefined) {
+    const note = verifyJobNote(input)
+    if (note !== undefined) lines.push(...note)
   }
   if (summary.unauthorized_files.length === 0 && input.missingReconcileAttempt === undefined && summary.resolved_unauthorized_files.length > 0) {
     // The freeze claim comes from the NEWEST reconcile audit, so an earlier finding

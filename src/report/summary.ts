@@ -37,12 +37,16 @@ export interface Summary {
   /**
    * Whether the NEWEST attempt settled as a pass, by the submit gate's own
    * definition (`newestVerifyOutcome`): the newest attempt DIRECTORY has a readable
-   * ok result, its verify JOB succeeded, and its reconcile audit is readable.
+   * ok result, its verify JOB settled successfully and NAMES THAT ATTEMPT, and its
+   * reconcile audit is readable.
    *
    * Not "the newest readable `result.json`", which is not the attempt a gate reads:
    * an attempt killed or frozen before its result landed left no result.json for
    * `loadVerifyAttempts` to return, and a verdict built from that list alone said
    * `verify_ok: true` about a run whose newest verification has no outcome at all.
+   * Nor "its verify job succeeded", which is not the same claim: a lost terminal
+   * write leaves no file for the job reader to miss, so the newest job on disk is an
+   * EARLIER attempt's and its `succeeded` status used to stand in for this one.
    */
   verify_ok: boolean
 }

@@ -8,7 +8,7 @@
  * coverage contract. Task 14 appends the whole-chain cases to this same file.
  */
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -1662,6 +1662,39 @@ describe('a damaged verification record stays visible instead of fatal', () => {
     expect(summary.unreadable_records).toEqual([corrupt])
     expect(await readFile(paths.reportMd, 'utf8')).toContain(corrupt)
   })
+
+  it('reports why a verify job record that names no attempt blocks submission', async () => {
+    // Reachable WITHOUT tampering: every run verified before `attempt` existed has a
+    // `succeeded` verify job record with no `attempt` on it. `clone_submit` refuses it
+    // (the record cannot show which attempt settled), while the closing report
+    // published only `最新一次 ok: false` plus a "Last job → succeeded" line belonging
+    // to an EARLIER attempt, with nothing connecting the two.
+    const { root, ctx } = await verifiedRun()
+    const { readJson, runPaths, writeAtomic } = await import('../src/core/artifacts.ts')
+    const paths = runPaths(join(root, 'runs'), 'r1')
+    const verifyJobFile = (await readdir(join(paths.dir, 'jobs'))).filter(name => name.startsWith('verify-')).sort().at(-1)
+    expect(verifyJobFile).toBeDefined()
+    const file = join(paths.dir, 'jobs', verifyJobFile ?? '')
+    const record = await readJson<Record<string, unknown>>(file)
+    expect(record?.attempt).toBe(1)
+    delete record!.attempt
+    await writeAtomic(file, `${JSON.stringify(record, null, 2)}\n`)
+
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError, rendered(submitted)).toBe(true)
+    expect(rendered(submitted)).toMatch(/does not record which attempt/)
+
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError, rendered(reported)).not.toBe(true)
+    const report = await readFile(paths.reportMd, 'utf8')
+    // The condition the gate refuses on is now stated, and the succeeded line it used
+    // to publish alone is explained by it.
+    expect(report).toContain('验证任务与最新尝试')
+    expect(report).toContain('没有记录它')
+    expect(report).toContain('**succeeded**')
+    const summary = JSON.parse(await readFile(paths.summaryJson, 'utf8')) as { verify_ok: boolean }
+    expect(summary.verify_ok).toBe(false)
+  })
 })
 
 describe('a resolved freeze is not reported as a freeze', () => {
@@ -2096,5 +2129,71 @@ describe('a lost revision pointer is not a licence to close over stale verdicts'
     expect((second as { isError?: boolean }).isError, rendered(second)).not.toBe(true)
     const closed = await call(ctx, 'clone_report', { run_id: 'r1' })
     expect((closed as { isError?: boolean }).isError, rendered(closed)).not.toBe(true)
+  })
+})
+
+describe('a damaged revision pointer leaves the run observable and the coverage conservative', () => {
+  /** One assessed cluster with a stamped verdict, and then the pointer written as garbage. */
+  async function damagedPointerRun(): Promise<{ root: string, ctx: Context, pointer: string }> {
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({ projectRoot: 'D:/repo', artifactsRoot: join(root, 'runs'), detection: { provider: 'csv', csvPath: csv } }, fakeRunner(GIT_OK))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    const assessed = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'report_only', priority: 'P1',
+      reason: 'renaming-only difference', evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'virtual void draw();' },
+    })
+    expect((assessed as { isError?: boolean }).isError, rendered(assessed)).not.toBe(true)
+    const { runPaths, writeAtomic } = await import('../src/core/artifacts.ts')
+    const { scanRevisionPath } = await import('../src/core/clusters.ts')
+    const paths = runPaths(join(root, 'runs'), 'r1')
+    const pointer = scanRevisionPath(paths)
+    await writeAtomic(pointer, '{not json\n')
+    return { root, ctx, pointer }
+  }
+
+  it('keeps every interface readable and names the pointer in the poll and the report', async () => {
+    const { root, ctx, pointer } = await damagedPointerRun()
+    // The progress interface is the one that must never die. `latestJob` and
+    // `loadVerifyAttempts` already skip-and-name their own damaged records; the
+    // revision pointer was read with a bare `readJson`, so a garbage pointer took
+    // clone_check, clone_report and clone_submit down with a JSON parse error.
+    const status = await call(ctx, 'clone_check', { run_id: 'r1', what: 'status' })
+    expect((status as { isError?: boolean }).isError, rendered(status)).not.toBe(true)
+    const payload = JSON.parse(rendered(status)) as { unreadable_revision_pointer: string[] }
+    expect(payload.unreadable_revision_pointer).toEqual(['clusters.jsonl.scan.json'])
+
+    // The report names it through the same unreadable-records section as a damaged job
+    // or verify record. `allow_partial` is the documented way to close the run the
+    // damaged pointer left with a gap.
+    const partial = await call(ctx, 'clone_report', { run_id: 'r1', allow_partial: true })
+    expect((partial as { isError?: boolean }).isError, rendered(partial)).not.toBe(true)
+    const summary = (JSON.parse(rendered(partial)) as { summary: { unreadable_records: string[] } }).summary
+    expect(summary.unreadable_records).toContain('clusters.jsonl.scan.json')
+    expect(await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')).toContain('clusters.jsonl.scan.json')
+    // Skipped, not deleted: the damaged file is still on disk exactly as it was left.
+    expect(await readFile(pointer, 'utf8')).toBe('{not json\n')
+
+    // `clone_submit` must refuse in words, not die with a JSON parse error.
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError).toBe(true)
+    expect(rendered(submitted)).not.toMatch(/JSON/)
+  })
+
+  it('stops counting a verdict stamped with a revision the cluster set can no longer be tied to', async () => {
+    const { ctx } = await damagedPointerRun()
+    // The conservative half, and why a damaged pointer is read as "no revision": a
+    // stamped verdict cannot be shown to speak about a cluster set whose revision
+    // nobody can read, so it does not cover it — exactly the rule a LOST pointer
+    // already follows. The other direction would close the run on a verdict about a
+    // cluster set that may have been replaced.
+    const page = JSON.parse(rendered(await call(ctx, 'clone_check', { run_id: 'r1', what: 'clusters' }))) as { gaps: string[] }
+    expect(page.gaps).toEqual(['C001'])
+
+    const refused = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((refused as { isError?: boolean }).isError, rendered(refused)).toBe(true)
+    expect(rendered(refused)).toMatch(/no verdict/)
   })
 })

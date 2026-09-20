@@ -545,6 +545,76 @@ describe('renderReport', () => {
     expect(text).not.toContain('## 未授权改动')
   })
 
+  it('explains a verify job that does not name the newest attempt, the state the gate refuses on', () => {
+    // Reachable WITHOUT tampering: every run verified before `attempt` existed has a
+    // `succeeded` verify job record that names no attempt. The report then published
+    // `最新一次 ok: false`, the unverified warning, `### attempt N — PASS` and a
+    // `## 最近的后台任务` line reading `verify-… (verify) → **succeeded**` — which is an
+    // EARLIER attempt's record, the newest left on disk — with nothing connecting them.
+    // Every line was true under the report's own definitions, and the operator still
+    // could not tell why `clone_submit` refuses; that "Last job → succeeded" line is
+    // exactly the shape the unreadable-records section exists to prevent.
+    const complete = new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]])
+    const passed: VerifyResult = {
+      attempt: 1, ok: true, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      rolled_back: false, rollback_files: [], steps: [],
+    }
+    // A record written before the field existed: no `attempt` key at all.
+    const legacy: JobRecord = {
+      job_id: 'verify-20260920-000000-aaaa', run_id: 'run-1', kind: 'verify', status: 'succeeded',
+      started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      error: null, summary: 'attempt 1: PASS',
+    }
+    const text = renderReport(input({
+      verify: [passed], assessments: complete,
+      newestAttempt: 1, verifyJob: legacy, audit: audit(),
+      // The run's last job is that same record, so the report shows the shape the
+      // operator reads as "the verification succeeded".
+      job: legacy,
+    }))
+    expect(text).toContain('## 最近的后台任务')
+    expect(text).toContain('**succeeded**')
+    expect(text).toContain('验证任务与最新尝试')
+    expect(text).toContain('没有记录它')
+    expect(text).toContain('attempt 1')
+    expect(text).toContain('clone_submit')
+    expect(text).toContain('clone_verify')
+
+    // The normal case: the same three records, with a job that NAMES the attempt, add
+    // no such section — the report must not cry wolf on a run that settled cleanly.
+    const settled = renderReport(input({
+      verify: [passed], assessments: complete, newestAttempt: 1, verifyJob: verifyJob('succeeded'), audit: audit(),
+    }))
+    expect(settled).not.toContain('验证任务与最新尝试')
+    expect(settled).not.toContain('没有记录它')
+  })
+
+  it('names a verify job that belongs to another attempt, and one that is missing outright', () => {
+    const complete = new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]])
+    const outcome = (attempt: number): VerifyResult => ({
+      attempt, ok: true, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      rolled_back: false, rollback_files: [], steps: [],
+    })
+    // Attempt 2 passed and then its terminal job record was lost; the newest verify job
+    // left on disk is attempt 1's succeeded one, which stood in for it.
+    const other = renderReport(input({
+      verify: [outcome(1), outcome(2)], assessments: complete,
+      newestAttempt: 2, verifyJob: verifyJob('succeeded', 1), audit: audit(),
+    }))
+    expect(other).toContain('属于 attempt 1')
+    expect(other).toContain('attempt 2')
+    expect(other).toContain('clone_verify')
+
+    // No verify job record at all: the gate refuses for the same reason, so the report
+    // says which record is missing rather than leaving the overview's `ok: false` with
+    // no explanation next to the last-job line.
+    const missing = renderReport(input({
+      verify: [outcome(1)], assessments: complete, newestAttempt: 1, audit: audit(),
+    }))
+    expect(missing).toContain('没有最新的 verify job 记录')
+    expect(missing).toContain('attempt 1')
+  })
+
   it('names an unreadable job record instead of reporting an older job as the last one', () => {
     // A corrupt `<id>.json` is skipped by `latestJob`, so the "last job" section would
     // silently present an OLDER job — in the artefact meant for audit. The skip has to

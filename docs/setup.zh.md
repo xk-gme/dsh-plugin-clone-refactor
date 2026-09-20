@@ -224,7 +224,7 @@ node $dsh web
 | 步骤 | 工具 | 行为 |
 |---|---|---|
 | 1 | `clone_scan` | 可选 `run_id`（沿用既有 run，或以该 id 新建——结果里的 `created` 指出是哪一种）、`module`（`python-pipeline` 路径需要它）、`csv_path`（覆盖 `detection.csvPath`）、`refresh`（已有簇时仍重扫）。返回 `accepted`、`job_id`、provider 与当前簇数。它在后台跑：先用 `clone_check` 的 `what: status` 轮询到 job 离开 `running`，再读簇 |
-| 2 | `clone_check` | 只读，且从不创建 run。`run_id` 加 `what`：`status`（最新的 job，或 `null`，以及读不出来的 `unreadable_jobs` 与 `unreadable_attempts` —— job 记录与验证记录各一份）、`clusters`（一页，带 `offset`、`next_offset` 与覆盖缺口）、`ledger`（每个簇的有效判定加授权记录）、`log`（最新步骤日志的尾部，`log_lines` 行，默认 80） |
+| 2 | `clone_check` | 只读，且从不创建 run。`run_id` 加 `what`：`status`（最新的 job，或 `null`，以及读不出来的 `unreadable_jobs`、`unreadable_attempts` 与 `unreadable_revision_pointer` —— job 记录、验证记录与扫描 revision 指针各一份）、`clusters`（一页，带 `offset`、`next_offset` 与覆盖缺口）、`ledger`（每个簇的有效判定加授权记录）、`log`（最新步骤日志的尾部，`log_lines` 行，默认 80） |
 | 3 | `clone_assess` | 每个簇一条判定：`verdict`、`priority`、`reason`；可选 `evidence` 与 `files_changed`，`replace: true` 覆盖既有判定。`patched` 判定需要 `confirm: true`、`authorization.enabled`、至少一个 `files_changed`、`evidence`，且优先级在 `authorization.maxPriority` 之内；**未**打 patch 的 `P0` 判定同样需要具体阻断点的证据。返回 `covered` / `total` / `remaining` |
 | 4 | `clone_verify` | 先把授权账本与 git 实际改动集合对账，写出 `verify/<n>/reconcile.json`；账本之外有改动就以 `UNAUTHORIZED_CHANGES` 拒绝；否则在后台按配置执行步骤。返回 `accepted`、`attempt` 序号与 `authorized_files` |
 | 5 | `clone_submit` | `confirm: true` 是强制项，且在别的检查之前先查；最新一次验证未通过的 run 不能提交，空账本则没有东西可提交。`mode` 对本次调用覆盖 `submit.mode` |
@@ -244,7 +244,7 @@ node $dsh web
 | `patches.json` | 授权账本：每个当前处于 `patched` 的簇一条记录（`cluster_id`、`priority`、`files_changed`、`recorded_at`，以及该判定所依据的 `evidence`）。撤回判定会删掉对应记录 |
 | `detection/` | 检测路径自己的产物：管线的 `func_clone_<module>.csv` 与 `detect-command.txt`（已脱敏的调用行）；`csv` 扫描的报告在别处时这里可以为空 |
 | `verify/<n>/` | 每次尝试一个目录：每步一份 `<序号>-<步骤>.log`、`result.json`（本次尝试的结论，含 `rolled_back`、`rollback_files` 与本次运行的 `configured_steps`）与 `reconcile.json`（授权文件 vs 实际改动） |
-| `jobs/<job_id>.json` | `clone_check` 轮询的 job 记录：`job_id`、`run_id`、`kind`（scan 或 verify）、`status`（running / succeeded / failed）、`started_at`、`finished_at`、`error`、`summary` |
+| `jobs/<job_id>.json` | `clone_check` 轮询的 job 记录：`job_id`、`run_id`、`kind`（scan 或 verify）、`status`（running / succeeded / failed）、`started_at`、`finished_at`、`error`、`summary`，以及仅 verify 记录才有的 `attempt` —— 该 job settle 的那次验证尝试编号；scan 记录、以及该字段出现之前写下的记录都没有它 |
 | `report.md` | 人读报告：概览、按优先级分组的簇及其证据、覆盖缺口、已授权改动、验证尝试、未授权改动、最后的 job、跳过的账本行与你的备注 |
 | `findings.json` | 机器可读的簇清单，每簇带判定、优先级、理由、`evidence`（文件、行号、片段；未记录时为 `null`）与已授权文件 |
 | `summary.json` | 计数：`run_id`、`baseline_head`、`detection_provider`、`cluster_path`、`clusters`、`recorded`、`missing`、`patched`、`report_only`、`skipped`、`by_priority`、`authorized_files`、`verify_attempts`、`verify_ok`、`unauthorized_files`、`resolved_unauthorized_files`、`unreadable_records`、`unverified`、`dropped_lines`，以及渲染报告内容的 `digest` |
