@@ -1,0 +1,45 @@
+# dsh-gme-clone-refactor bundle patch — the `dsh.bundle.patch` layer of this package.
+#
+#   dsh plugin --profile web add dsh-gme-clone-refactor
+#
+# installs the package and appends `dsh-gme-clone-refactor` to the profile's
+# `dsh.profile.bundles`; the next boot merges THIS patch (a single `insert` of the
+# plugin row). No profile file has to be edited by hand.
+#
+# The row is always mounted, and an empty projectRoot is a supported state rather
+# than a failure: the plugin then registers no tools, logs one warning, and
+# publishes the full configuration procedure to the model, so an agent asked for a
+# clone refactor can tell the user how to finish the setup. It must never throw — a
+# row whose config fails validation takes the entire plugin tree down with it
+# ("dsh: 1 entry did not activate") — which is why every path below is read as an
+# expression with a fallback instead of being required.
+#
+# Two ways to configure it.
+#
+# 1. Environment (this layer already reads it):
+#      $env:GME_CLONE_REFACTOR_ROOT      = 'D:/workspace/GME'
+#      $env:GME_CLONE_REFACTOR_ARTIFACTS = 'D:/workspace/gme-clone-runs'   # optional
+#    These must be present when Harness STARTS, not when a tool is called.
+#
+# 2. A profile patch override. `- id:` replaces only the keys it names, whole
+#    `config` included, so restate every field you keep:
+#
+#      - id: gme-clone-refactor
+#        config:
+#          projectRoot: D:/workspace/GME
+#          artifactsRoot: D:/workspace/gme-clone-runs
+#          detection:
+#            provider: csv
+#            csvPath: D:/workspace/clone-reports/func_clone_base.csv
+#          authorization:
+#            enabled: false
+#            maxPriority: P0
+#            maxClusters: 1
+#          submit:
+#            mode: none
+- insert:
+    - id: gme-clone-refactor
+      name: 'dsh-gme-clone-refactor'
+      config:
+        projectRoot: !!js process.env.GME_CLONE_REFACTOR_ROOT ?? ''
+        artifactsRoot: !!js process.env.GME_CLONE_REFACTOR_ARTIFACTS ?? ''

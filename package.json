@@ -1,0 +1,54 @@
+{
+  "name": "dsh-gme-clone-refactor",
+  "version": "0.1.0",
+  "description": "GME clone-refactor workflow for DeepSeek Harness: scan clone clusters, assess them, apply one authorized minimal patch, verify it with a real build and test, and submit only what passed.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": ["lib", "cordis.patch.yml", "docs", "!docs/superpowers", "README.md", "README.zh.md", "LICENSE"],
+  "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "gme", "clone-detection", "clone-refactor", "cpp"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/nuaaweixinye/dsh-gme-clone-refactor.git" },
+  "homepage": "https://github.com/nuaaweixinye/dsh-gme-clone-refactor",
+  "bugs": { "url": "https://github.com/nuaaweixinye/dsh-gme-clone-refactor/issues" },
+  "publishConfig": { "registry": "https://registry.npmjs.org/", "access": "public" },
+  "engines": { "node": "^22.19.0 || >=24.0.0", "dsh": ">=0.1.2-alpha.1 <0.2.0-0" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "verify": "npm run typecheck && npm run build && npm run test",
+    "prepare": "tsdown",
+    "prepack": "tsdown"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-subprocess": ">=0.1.2-alpha.1 <0.2.0-0",
+    "@deepseek-ai/dsh-system-prompt": ">=0.1.2-alpha.1 <0.2.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.1.2-alpha.1 <0.2.0-0",
+    "@deepseek-ai/dsh-util-values": ">=0.1.2-alpha.1 <0.2.0-0",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/cordis-plugin-include": "^1.0.7",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.3",
+    "@deepseek-ai/dsh-llm": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-subprocess": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-system-prompt": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-tools": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-util-values": "0.1.2-alpha.5",
+    "@deepseek-ai/schemastery": "^3.18.2",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.20.0",
+    "js-yaml": "^4.1.0",
+    "tsdown": "^0.22.2",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  }
+}
