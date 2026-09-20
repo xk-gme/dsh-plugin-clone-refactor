@@ -3963,6 +3963,11 @@ git commit -m "feat(submit): commit, push and open a PR strictly by mode"
 > 4. **`GIT_OK` 缺 `['git checkout -B', …]`**：`authorization.enabled: true` 会让 `openRun` 建分支，未脚本化的命令使 `clone_scan` 在断言前失败。
 >
 > 另有两处实现时的必需调整：输出 schema 会推断出 `{keys} & Record<string, JsonValue>`，`JobRecord`/`ReportSummary` 无法满足，实现者加了 `asJson` 投影（并用深相等测试钉住无损）；以及实现者自查发现 **R27 与 R35 原本没有覆盖测试**，补上并对 R27 做了变异检验。
+>
+> **修复轮又修正了三处（`e6f2459`），因此本节清单在这三点上都已过时：**
+> 1. **R49 — 改判离开 `patched` 时必须删除授权记录。** 清单只写了 "upsert"，没写"新判定不是 `patched` 时怎么办"：`replace: true` 把某簇改判为 `report_only`/`skipped` 后，`patches.json` 里会留下**孤儿记录** —— `clone_verify` 继续授权那些文件、`clone_submit` 继续提交、报告继续列为已授权，而当前判定说这个簇不该 patch。这是**同意权被过期数据覆盖**，不是显示问题。
+> 2. **R48 — `maxPriority` 的比较方向**（已就地改正：从 `<` 改为 `>`，`'P0'` 现在表示"只允许 P0"）。
+> 3. **回滚必须在写 `result.json` 之后。** 清单把 `checkoutFiles` 写在写盘之前：回滚一抛，detached 任务失败、`result.json` 永远不写，报告于是说"没有跑过验证"而步骤日志就在 `verify/1/` 下，且下一次 `clone_verify` 会复用同一 attempt 并**覆盖那些日志**。
 
 **Files:**
 - Create: `src/tools.ts`
