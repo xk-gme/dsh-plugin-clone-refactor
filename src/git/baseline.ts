@@ -33,8 +33,9 @@ export function parseNameOnly(text: string): string[] {
 async function capture(runner: CommandRunner, cwd: string, argv: readonly string[]): Promise<string> {
   const result = await runner.run({ argv, cwd, timeoutMs: 60_000, signal: undefined })
   if (result.exitCode !== 0) {
-    const detail = (result.stderr.trim() || result.stdout.trim() || `exit ${String(result.exitCode)}`).slice(0, 500)
-    throw new Error(`${argv.join(' ')} failed in ${cwd}: ${detail}`)
+    // The same rendering as `detail`, not a second copy of it: the local copy this
+    // replaced printed an empty message whenever a failure produced no failure output.
+    throw new Error(`${argv.join(' ')} failed in ${cwd}: ${detail(result)}`)
   }
   return result.stdout
 }
