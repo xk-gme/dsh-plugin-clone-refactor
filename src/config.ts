@@ -63,8 +63,19 @@ export interface Settings {
 /** What a warning prints in place of a value nothing here can describe. */
 const UNRENDERABLE = '[unserializable]'
 
-function record(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+/**
+ * Read a nested section. A *present* value that is not a plain object is a
+ * configuration mistake, and this file exists so mistakes are reported: a
+ * silently-defaulted `detection: 42` leaves the operator with no idea why their
+ * settings do nothing. An absent value is not a mistake and warns nothing.
+ */
+function record(value: unknown, label: string, warnings: string[]): Record<string, unknown> {
+  if (value === undefined || value === null) return {}
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    warnings.push(`${label} must be an object; using its defaults`)
+    return {}
+  }
+  return value as Record<string, unknown>
 }
 
 /**
@@ -136,7 +147,14 @@ function verifySteps(value: unknown, warnings: string[]): VerifyStep[] {
   }
   const steps: VerifyStep[] = []
   for (const [index, item] of value.entries()) {
-    const raw = record(item)
+    // Guarded here rather than through `record` so one bad item yields exactly one
+    // warning: a non-object entry is dropped, it does not also complain about a
+    // missing name and command.
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+      warnings.push(`verify.steps[${index}] must be an object; dropped`)
+      continue
+    }
+    const raw = item as Record<string, unknown>
     const name = typeof raw.name === 'string' ? raw.name.trim() : ''
     const command = typeof raw.command === 'string' ? raw.command.trim() : ''
     if (name === '' || command === '') {
@@ -159,7 +177,7 @@ function verifySteps(value: unknown, warnings: string[]): VerifyStep[] {
 }
 
 function detectionSettings(value: unknown, warnings: string[]): DetectionSettings {
-  const raw = record(value)
+  const raw = record(value, 'detection', warnings)
   return {
     provider: oneOf(raw.provider, PROVIDERS, 'csv', 'detection.provider', warnings),
     csvPath: text(raw.csvPath, '', 'detection.csvPath', warnings),
@@ -180,13 +198,13 @@ function detectionSettings(value: unknown, warnings: string[]): DetectionSetting
  */
 export function resolveSettings(raw: unknown): { settings: Settings; warnings: string[] } {
   const warnings: string[] = []
-  const source = record(raw)
+  const source = record(raw, 'config', warnings)
   const projectRoot = text(source.projectRoot, '', 'projectRoot', warnings)
   const reportLanguage = oneOf(source.reportLanguage, ['zh', 'en'] as const, 'zh', 'reportLanguage', warnings)
-  const authorization = record(source.authorization)
-  const verify = record(source.verify)
-  const submit = record(source.submit)
-  const workdir = record(source.workdir)
+  const authorization = record(source.authorization, 'authorization', warnings)
+  const verify = record(source.verify, 'verify', warnings)
+  const submit = record(source.submit, 'submit', warnings)
+  const workdir = record(source.workdir, 'workdir', warnings)
   return {
     settings: {
       projectRoot: projectRoot === '' ? '' : resolve(projectRoot),

@@ -38,6 +38,14 @@ describe('resolveSettings', () => {
     expect(settings.projectRoot.replaceAll('\\', '/')).toBe(`${process.cwd().replaceAll('\\', '/')}/relative/repo`)
   })
 
+  it('warns about a nested section that is not an object instead of silently defaulting it', () => {
+    const { settings, warnings } = resolveSettings({ detection: 42, verify: 'nope' })
+    expect(settings.detection.provider).toBe('csv')
+    expect(settings.verify.steps).toEqual([])
+    expect(warnings.join('\n')).toMatch(/detection must be an object/)
+    expect(warnings.join('\n')).toMatch(/verify must be an object/)
+  })
+
   it('keeps a well-formed verify step list and drops malformed entries', () => {
     const { settings, warnings } = resolveSettings({
       verify: {
@@ -46,7 +54,8 @@ describe('resolveSettings', () => {
           { name: 'build-debug', phase: 'build', command: 'msbuild tests.sln', required: true, timeoutMs: 600000 },
           { name: '', command: 'echo x' },
           { name: 'no-command' },
-          { name: 'restore-config', phase: 'restore', command: 'restore.ps1', always: true },
+          // No `always` key on purpose: the default is what this case exists to pin.
+          { name: 'restore-config', phase: 'restore', command: 'restore.ps1' },
         ],
       },
     })
@@ -56,8 +65,9 @@ describe('resolveSettings', () => {
       name: 'build-debug', phase: 'build', command: 'msbuild tests.sln',
       required: true, always: false, timeoutMs: 600000,
     })
-    // `always` defaults to true for the restore phase: a restore step that is
-    // skipped after a failure is the one thing a pipeline must never do.
+    // `always` defaults to true only for the restore phase — a restore step that
+    // is skipped after a failure is the one thing a pipeline must never do. Both
+    // halves are asserted: passing `always: true` explicitly would test nothing.
     expect(settings.verify.steps[1]?.always).toBe(true)
     expect(warnings.join('\n')).toMatch(/verify\.steps\[1\]/)
     expect(warnings.join('\n')).toMatch(/verify\.steps\[2\]/)
