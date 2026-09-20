@@ -58,12 +58,36 @@ export function parseNameOnly(text: string): string[] {
  * recorded `rolled_back: true` over files it never restored.
  *
  * Every read whose STDOUT is the payload uses this. The mutating commands
- * (`checkout -B`, `restore`, `clean`) are checked on their exit code alone: their
- * stdout is a log line, and a truncated log says nothing about whether the command
+ * (`checkout -B`, `restore`, `clean`) use {@link assertCompleted} instead: their
+ * stdout is a log line, so `lossy` on it says nothing about whether the command
  * applied.
  */
 function assertTrustworthy(result: CommandResult, context: string): void {
   if (result.exitCode === 0 && !result.timedOut && !result.lossy) return
+  throw new Error(`${context}: ${detail(result)}`)
+}
+
+/**
+ * The standard for a MUTATING git command: it exited 0 and it was not cut off by
+ * our own deadline.
+ *
+ * `lossy` is deliberately not checked here — these commands print a log line
+ * ("Switched to a new branch", "Removing x"), not a payload this process parses,
+ * so a truncated log is no evidence of failure. `timedOut` is a different fact and
+ * is refused. It is read from the `AbortSignal.timeout` this plugin owns, never
+ * from the outcome, and the subprocess seam classifies no exit fact as a timeout
+ * (`SubprocessOutcome` carries no timeout vocabulary, and its own tests show
+ * `done` settling `{ exitCode: 0, signal: null }` after `terminate()`), so
+ * `timedOut: true` with `exitCode: 0` is reachable: a child that traps SIGTERM, or
+ * one that finishes exactly as the deadline fires. Treating that as success would
+ * let `checkoutFiles` record `rolled_back: true`, and `createBranch` report a
+ * branch it never created, over a command that may not have completed.
+ */
+function assertCompleted(result: CommandResult, context: string): void {
+  if (result.exitCode === 0 && !result.timedOut) return
+  if (result.timedOut) {
+    throw new Error(`${context}: the command was cut off by its timeout (exit ${String(result.exitCode)})`)
+  }
   throw new Error(`${context}: ${detail(result)}`)
 }
 
@@ -84,20 +108,57 @@ function detail(result: CommandResult): string {
 export async function readBaseline(runner: CommandRunner, projectRoot: string): Promise<Baseline> {
   const head = (await capture(runner, projectRoot, ['git', 'rev-parse', 'HEAD'])).trim()
   const branch = (await capture(runner, projectRoot, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'])).trim()
-  const status = await runner.run({ argv: ['git', 'status', '--porcelain', '-z'], cwd: projectRoot, timeoutMs: 60_000, signal: undefined })
   // A status we cannot trust is NOT a clean tree. `dirty: []` from a timeout, a
   // null exit or a truncated capture reads to Task 6 as "safe to patch", and the
-  // whole point of the baseline is that the tree's state is known.
+  // whole point of the baseline is that the tree's state is known. `changedFiles`
+  // reads the same status through this same helper, so the two can never disagree
+  // about what an unreadable status means.
+  return { head, branch, dirty: await readDirtyFiles(runner, projectRoot) }
+}
+
+/**
+ * The one guarded `git status --porcelain -z` read: the parsed dirty list, or a
+ * throw.
+ *
+ * Shared by `readBaseline` and `changedFiles`. The guard has to live inside the
+ * read, not at one call site: an unreadable status has an empty (or partial)
+ * `stdout`, and both callers read that emptiness as a fact — "the tree is clean",
+ * "nothing changed" — when it is the absence of a fact.
+ */
+async function readDirtyFiles(runner: CommandRunner, projectRoot: string): Promise<string[]> {
+  const status = await runner.run({ argv: ['git', 'status', '--porcelain', '-z'], cwd: projectRoot, timeoutMs: 60_000, signal: undefined })
   assertTrustworthy(status, `Cannot read the git status of ${projectRoot}`)
-  return { head, branch, dirty: parsePorcelain(status.stdout) }
+  return parsePorcelain(status.stdout)
+}
+
+/**
+ * The change set `clone_verify` reconciles the authorization ledger against: the
+ * parsed, deduplicated union of the work tree's status and its diff against the
+ * baseline commit.
+ *
+ * This is one guarded helper rather than two reads in the tool layer because that
+ * duplication is exactly how the authorization gate went vacuous: `clone_verify`
+ * ran its own `git status`/`git diff` and checked neither `exitCode`, `timedOut`
+ * nor `lossy`, so a timed-out or truncated read produced `changed: []`,
+ * `reconcile` reported `unauthorized: []`, and verification proceeded over an
+ * out-of-ledger change nobody had seen.
+ *
+ * `-z` on both reads: it is the only form that survives a path containing a space
+ * or a non-ASCII character. The default forms C-quote and octal-escape such paths,
+ * so the parsers could produce a string that never equals the real one and freeze
+ * a legitimate run with `UNAUTHORIZED_CHANGES` naming a file that does not exist.
+ */
+export async function changedFiles(runner: CommandRunner, projectRoot: string, head: string): Promise<string[]> {
+  const dirty = await readDirtyFiles(runner, projectRoot)
+  const diff = await runner.run({ argv: ['git', 'diff', '--name-only', '-z', head], cwd: projectRoot, timeoutMs: 60_000, signal: undefined })
+  assertTrustworthy(diff, `Cannot read the diff against ${head} in ${projectRoot}`)
+  return [...new Set([...dirty, ...parseNameOnly(diff.stdout)])]
 }
 
 /** Create and switch to the run's own branch; an existing branch is reused. */
 export async function createBranch(runner: CommandRunner, projectRoot: string, branch: string): Promise<void> {
   const result = await runner.run({ argv: ['git', 'checkout', '-B', branch], cwd: projectRoot, timeoutMs: 60_000, signal: undefined })
-  if (result.exitCode !== 0) {
-    throw new Error(`Cannot create branch ${branch} in ${projectRoot}: ${detail(result)}`)
-  }
+  assertCompleted(result, `Cannot create branch ${branch} in ${projectRoot}`)
 }
 
 /**
@@ -130,16 +191,12 @@ export async function checkoutFiles(runner: CommandRunner, projectRoot: string, 
     // Explicit source: restore both the index and the work tree from the baseline
     // commit, never from whatever happens to be staged.
     const restored = await runner.run({ argv: ['git', '--literal-pathspecs', 'restore', '--source=HEAD', '--staged', '--worktree', '--', ...known], cwd: projectRoot, timeoutMs: 120_000, signal: undefined })
-    if (restored.exitCode !== 0) {
-      throw new Error(`Cannot roll back ${known.join(', ')}: ${detail(restored)}`)
-    }
+    assertCompleted(restored, `Cannot roll back ${known.join(', ')}`)
   }
   if (added.length > 0) {
     // A file the run created is removed, not restored. `-f` is required; no `-x`,
     // so an ignored file the user owns is never touched.
     const removed = await runner.run({ argv: ['git', '--literal-pathspecs', 'clean', '-f', '--', ...added], cwd: projectRoot, timeoutMs: 60_000, signal: undefined })
-    if (removed.exitCode !== 0) {
-      throw new Error(`Cannot remove the files this run added (${added.join(', ')}): ${detail(removed)}`)
-    }
+    assertCompleted(removed, `Cannot remove the files this run added (${added.join(', ')})`)
   }
 }

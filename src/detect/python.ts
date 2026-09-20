@@ -11,7 +11,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Settings } from '../config.ts'
 import { ensureDir } from '../core/artifacts.ts'
-import { clustersFromRecords, parseCsv, recordsOf } from './cluster.ts'
+import { clustersFromRecords, hasCloneColumns, parseCsv, recordsOf } from './cluster.ts'
 import type { CloneDetector, DetectInput, DetectResult } from './provider.ts'
 
 export interface BuildArgvOptions {
@@ -115,6 +115,21 @@ export function pythonDetector(): CloneDetector {
         throw new Error(`The pipeline exited 0 but wrote no ${`func_clone_${target}.csv`}; inspect ${paths.detectionDir}`)
       }
       const { header, rows } = parseCsv(text)
+      // A CSV this parser cannot read is the SAME silent-zero-clusters failure as
+      // exit 0 with no CSV: `clustersFromRecords` drops every row whose left or
+      // right file is empty, so an unrecognized header comes back as `clusters: []`
+      // — byte-identical to "this module has no clones". The `csv` detector already
+      // refuses this at its own boundary with `hasCloneColumns`; without the same
+      // refusal here the two providers disagree about whether an unreadable report
+      // is a refusal or a clean result. A recognized header with no rows is a
+      // different thing entirely and still returns zero clusters.
+      if (!hasCloneColumns(header)) {
+        throw new Error(
+          `${csv} is not a clone report this provider can read: its header (${header.join(', ') || 'empty'}) `
+          + 'names no file1/file2 column pair, so every row would be dropped and the module would look clone-free. '
+          + 'The pipeline exited 0, so this is a report it wrote that this plugin cannot interpret.',
+        )
+      }
       return {
         clusters: clustersFromRecords(recordsOf(header, rows)),
         provider: 'python-pipeline',

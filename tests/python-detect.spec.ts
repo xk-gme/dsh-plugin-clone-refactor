@@ -120,6 +120,39 @@ describe('pythonDetector', () => {
       .rejects.toThrow(/func_clone_base\.csv/)
   })
 
+  it('refuses a CSV whose header names no clone columns instead of reporting zero clusters', async () => {
+    const dir = await workspace()
+    const paths = runPaths(dir, 'r1')
+    const settings = resolveSettings({ projectRoot: 'D:/gme', detection: { pythonPath: 'py.exe', scriptPath: 'D:/agent/run.py' } }).settings
+    await mkdir(join(paths.detectionDir, 'base'), { recursive: true })
+    // A pipeline summary rather than a clone report: `clustersFromRecords` drops
+    // every row it cannot place, so this used to come back as `clusters: []` —
+    // byte-identical to "this module has no clones". That is the same
+    // silent-zero-clusters failure as exit 0 with no CSV at all.
+    await writeFile(join(paths.detectionDir, 'base', 'func_clone_base.csv'),
+      'module,total_pairs,generated_at\nbase,0,2026-09-20T00:00:00Z\n')
+    const runner = fakeRunner([['py.exe -u D:/agent/run.py', { stdout: 'done\n' }]])
+    const error = await pythonDetector().detect({ settings, runner, paths, module: 'base', csvPath: '', signal: undefined })
+      .then(() => undefined, (caught: unknown) => caught as Error)
+    expect(error?.message).toContain('func_clone_base.csv')
+    expect(error?.message).toContain('total_pairs')
+    expect(error?.message).toMatch(/file1\/file2/)
+  })
+
+  it('still reads a recognized header with no rows as zero clusters', async () => {
+    const dir = await workspace()
+    const paths = runPaths(dir, 'r1')
+    const settings = resolveSettings({ projectRoot: 'D:/gme', detection: { pythonPath: 'py.exe', scriptPath: 'D:/agent/run.py' } }).settings
+    await mkdir(join(paths.detectionDir, 'base'), { recursive: true })
+    await writeFile(join(paths.detectionDir, 'base', 'func_clone_base.csv'),
+      'pair_id,file1,func1_name,lines1,file2,func2_name,lines2,similarity,detection_method\n')
+    const runner = fakeRunner([['py.exe -u D:/agent/run.py', { stdout: 'done\n' }]])
+    const result = await pythonDetector().detect({ settings, runner, paths, module: 'base', csvPath: '', signal: undefined })
+    // A module with no clones is a legitimate answer, not an unreadable report.
+    expect(result.clusters).toEqual([])
+    expect(result.provider).toBe('python-pipeline')
+  })
+
   it('refuses to run when no script path is configured', async () => {
     const dir = await workspace()
     const settings = resolveSettings({ projectRoot: 'D:/gme' }).settings

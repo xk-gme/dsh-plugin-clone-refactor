@@ -154,6 +154,22 @@ describe('hostRunner', () => {
     expect(result.timedOut).toBe(true)
   })
 
+  it('reports exit 0 together with our own deadline, so a timed-out command can look successful', async () => {
+    // `timedOut` is read from the AbortSignal this module owns, never from the
+    // outcome, and the subprocess seam classifies no exit fact as a timeout: a child
+    // that traps SIGTERM, or one that finishes exactly as the deadline fires, settles
+    // as `{ exitCode: 0, signal: null }`. The two facts therefore co-occur, which is
+    // why a mutating command must not treat `exitCode === 0` as proof it completed.
+    const ctx = contextWith(service({
+      spawn: (spawnSpec) => handle(new Promise<SubprocessOutcome>((resolve) => {
+        spawnSpec.signal?.addEventListener('abort', () => resolve({ exitCode: 0, signal: null }))
+      })),
+    }))
+    const result = await hostRunner(ctx, DEFAULTS).run({ ...request(['traps-sigterm.exe']), timeoutMs: 5 })
+    expect(result.exitCode).toBe(0)
+    expect(result.timedOut).toBe(true)
+  })
+
   it('classifies a deadline that fired together with a caller cancellation as a cancellation', async () => {
     const controller = new AbortController()
     const ctx = contextWith(service({

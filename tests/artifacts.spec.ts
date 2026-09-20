@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, open, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -179,46 +179,82 @@ describe('renameWithRetry', () => {
 })
 
 describe('a concurrent reader holding the target', () => {
+  /**
+   * The whole budget `renameWithRetry` spends before it gives up:
+   * 5 + 10 + 20 + 40 + 80 + 160 + 320 + 320 + 320 = 1_275 ms.
+   *
+   * That budget is a claim about the READER: a hold shorter than this window can
+   * never exhaust it, because once the reader releases the target some later attempt
+   * must succeed. A single hold that outlasts the whole window — a release timer
+   * delayed past every attempt — is the documented residual of a bounded retry, and
+   * the only escape admitted below.
+   */
+  const RETRY_WINDOW_MS = 1_275
+
+  /**
+   * How long the reader keeps its handle on the target for each write.
+   *
+   * This is the property the retry rests on, so the test states it instead of hoping
+   * a free-running poll loop happens to be paced fast enough: the reader TAKES the
+   * target, the write's first rename attempt collides with that open handle, and the
+   * reader RELEASES it well inside the retry window so a later attempt lands.
+   *
+   * That coordination is what makes the test load-insensitive. A poll loop holds the
+   * target for as long as `readFile` takes, which on a loaded machine is unbounded,
+   * and a reader that holds (or immediately re-opens) through all ten attempts
+   * defeats any bounded retry — that is how this test failed once in a full-suite
+   * run. With one bounded hold per write there is exactly one colliding attempt to
+   * recover from, and recovering is the only thing being asserted.
+   */
+  const READER_HOLD_MS = 25
+
+  /**
+   * Each iteration costs one hold, so the count is paid for in wall-clock time, not
+   * in red power: the coordination makes a lost retry fail on the FIRST iteration (a
+   * bare rename collides immediately), and repeating it pins that many serial writes
+   * in a row all survive. 40 x 25 ms keeps the test near a second.
+   */
+  const WRITES = 40
+
   it('never fails a write with a transient rename errno', async () => {
     const root = await tempRoot()
     const file = join(root, 'scan-1.json')
     await writeAtomic(file, '{"status":"running"}')
 
     // The reporter's race at suite scale: a writer persisting one record after
-    // another while the poller reads that same record. Both sides are paced the
-    // way production paces them — one write at a time, a poll every tick — so the
-    // reader holds no handle in between. The writes are serial, which is how a
-    // job record is actually rewritten, and that is what keeps the bounded
-    // backoff sufficient. Without the retry the measured failure rate is ~16% per
-    // write, so 150 iterations fail a regression with probability ~1 - 0.84^150;
-    // the whole run still costs about a second.
-    let stop = false
-    const reader = (async () => {
-      while (!stop) {
-        await readFile(file, 'utf8').catch(() => undefined)
-        await new Promise(resolve => setTimeout(resolve, 1))
-      }
-    })()
-    await new Promise(resolve => setTimeout(resolve, 5))
-
-    const transients = new Map<string, number>()
-    try {
-      for (let index = 0; index < 150; index += 1) {
-        const record = JSON.stringify({ status: index % 2 === 0 ? 'succeeded' : 'failed', n: index })
-        try {
-          await writeAtomic(file, record)
-        } catch (error) {
-          const code = (error as NodeJS.ErrnoException).code ?? 'none'
-          if (TRANSIENT_RENAME_CODES.includes(code)) transients.set(code, (transients.get(code) ?? 0) + 1)
-          else throw error
-        }
-      }
-    } finally {
-      stop = true
-      await reader
+    // another while a poller reads that same record, one write at a time — which is
+    // how a job record is actually rewritten.
+    const escapes: Array<{ code: string, heldMs: number }> = []
+    const unattributable: unknown[] = []
+    for (let index = 0; index < WRITES; index += 1) {
+      const record = JSON.stringify({ status: index % 2 === 0 ? 'succeeded' : 'failed', n: index })
+      const reader = await open(file, 'r')
+      const holdStart = performance.now()
+      // Deliberately not awaited here: its first rename attempt must collide with the
+      // open handle above. The rejection is turned into a value immediately so the
+      // gap until it is awaited cannot surface as an unhandled rejection.
+      const settled = writeAtomic(file, record).then(() => undefined, (error: unknown) => error)
+      await new Promise(resolve => setTimeout(resolve, READER_HOLD_MS))
+      await reader.readFile('utf8')
+      await reader.close()
+      const heldMs = performance.now() - holdStart
+      const error = await settled
+      if (error === undefined) continue
+      const code = (error as NodeJS.ErrnoException).code ?? 'none'
+      if (!TRANSIENT_RENAME_CODES.includes(code)) throw error
+      // A hold shorter than the retry window cannot explain an exhausted retry: the
+      // write's attempts continue for ~1.275 s after the hold began, so once this
+      // reader released, a later attempt had to succeed. Anything else is a lost
+      // retry and must fail here.
+      if (heldMs < RETRY_WINDOW_MS) unattributable.push(error)
+      else escapes.push({ code, heldMs })
     }
 
-    expect([...transients]).toEqual([])
+    // A lost retry — the failure this test exists to catch — is asserted as empty
+    // rather than tolerated. A non-empty `escapes` is the documented residual of a
+    // bounded retry, and only a hold that outlasted the entire window may land there.
+    expect(unattributable).toEqual([])
+    expect(escapes.every(escape => escape.heldMs >= RETRY_WINDOW_MS)).toBe(true)
     expect(JSON.parse(await readFile(file, 'utf8'))).toHaveProperty('status')
     expect((await readdir(root)).filter(name => name.endsWith('.tmp'))).toEqual([])
   })

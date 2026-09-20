@@ -580,6 +580,77 @@ describe('clone_verify', () => {
     expect(audit.unauthorized).toEqual([])
     expect((JSON.parse(await readFile(join(runDir, 'result.json'), 'utf8')) as { ok: boolean }).ok).toBe(true)
   })
+
+  // The authorization gate is only as good as the change set it reconciles. An
+  // unreadable read leaves `stdout` empty or partial, `reconcile` reports
+  // `unauthorized: []`, and the gate passes vacuously — so both guarded reads must
+  // refuse instead of handing an empty change set to `reconcile`.
+  it('refuses to reconcile when the status read cannot be trusted', async () => {
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true },
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
+    }, fakeRunner([
+      // First-match-wins, and an array is consumed one entry per call: `clone_scan`
+      // must read a clean tree, then `clone_verify`'s own read times out.
+      ['git status --porcelain', [{ stdout: '' }, { exitCode: null, signal: 'SIGTERM', timedOut: true }]],
+      ['git diff --name-only -z abc123', { stdout: '' }],
+      ...GIT_OK,
+      ['msbuild', { stdout: 'Build succeeded\n' }],
+    ]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    const assessed = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'body identical, extracted a helper', files_changed: ['module/laws/src/a.cpp'],
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    expect((assessed as { isError?: boolean }).isError, rendered(assessed)).not.toBe(true)
+
+    const verified = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((verified as { isError?: boolean }).isError).toBe(true)
+    expect(rendered(verified)).toMatch(/Cannot read the git status/)
+    // The refusal happens before the audit, so no attempt was recorded.
+    await expect(readFile(join(root, 'runs', 'r1', 'verify', '1', 'reconcile.json'), 'utf8')).rejects.toThrow()
+  })
+
+  it('refuses to reconcile when the diff read cannot be trusted', async () => {
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true },
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
+    }, fakeRunner([
+      ['git status --porcelain', [{ stdout: '' }, { stdout: ' M module/laws/src/a.cpp\u0000' }]],
+      ['git diff --name-only -z abc123', { lossy: true, stdout: 'module/laws/src/a.cpp\u0000' }],
+      ...GIT_OK,
+      ['msbuild', { stdout: 'Build succeeded\n' }],
+    ]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    const assessed = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'body identical, extracted a helper', files_changed: ['module/laws/src/a.cpp'],
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    expect((assessed as { isError?: boolean }).isError, rendered(assessed)).not.toBe(true)
+
+    const verified = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((verified as { isError?: boolean }).isError).toBe(true)
+    expect(rendered(verified)).toMatch(/Cannot read the diff against abc123/)
+    await expect(readFile(join(root, 'runs', 'r1', 'verify', '1', 'reconcile.json'), 'utf8')).rejects.toThrow()
+  })
 })
 
 describe('clone_verify auto-rollback', () => {

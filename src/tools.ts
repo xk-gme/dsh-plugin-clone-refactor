@@ -13,7 +13,7 @@ import { loadRun, openRun, saveRun } from './core/run.ts'
 import { requireText, VERDICTS, type Assessment, type PatchRecord } from './core/schema.ts'
 import { csvDetector } from './detect/csv.ts'
 import { pythonDetector } from './detect/python.ts'
-import { checkoutFiles, parseNameOnly, parsePorcelain } from './git/baseline.ts'
+import { changedFiles, checkoutFiles } from './git/baseline.ts'
 import { reconcile } from './git/reconcile.ts'
 import { writeReport } from './report/report.ts'
 import { renderCommitMessage, submit } from './submit.ts'
@@ -303,14 +303,12 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       }
       const patches = await loadPatches(paths)
       const authorized = authorizedFiles(patches)
-      // `-z` on both reads: it is the only form that survives a path containing a
-      // space or a non-ASCII character. The default forms C-quote and octal-escape
-      // such paths, so the parsers below could produce a string that never equals the
-      // real one and freeze a legitimate run with UNAUTHORIZED_CHANGES naming a file
-      // that does not exist.
-      const status = await runner.run({ argv: ['git', 'status', '--porcelain', '-z'], cwd: record.project_root, timeoutMs: 60_000, signal: undefined })
-      const diff = await runner.run({ argv: ['git', 'diff', '--name-only', '-z', record.baseline.head], cwd: record.project_root, timeoutMs: 60_000, signal: undefined })
-      const changed = [...new Set([...parsePorcelain(status.stdout), ...parseNameOnly(diff.stdout)])]
+      // One guarded read, in `git/baseline.ts`, for exactly this reconcile. The
+      // authorization gate is only as good as the change set it reads: an
+      // unreadable status or diff leaves `stdout` empty or partial, `reconcile`
+      // then reports `unauthorized: []`, and the freeze below can never fire. The
+      // guard refuses such a read instead of reconciling against it.
+      const changed = await changedFiles(runner, record.project_root, record.baseline.head)
       const audit = reconcile(authorized, changed)
       const attempt = (await loadVerifyAttempts(paths)).length + 1
       await writeAtomic(join(paths.verifyDir, String(attempt), 'reconcile.json'), `${JSON.stringify({ authorized, changed, ...audit }, null, 2)}\n`)

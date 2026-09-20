@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { checkoutFiles, parseNameOnly, parsePorcelain, readBaseline } from '../src/git/baseline.ts'
+import { changedFiles, checkoutFiles, createBranch, parseNameOnly, parsePorcelain, readBaseline } from '../src/git/baseline.ts'
+import type { CommandResult } from '../src/core/command.ts'
 import { normalizePath } from '../src/core/paths.ts'
 import { reconcile } from '../src/git/reconcile.ts'
 import { fakeRunner } from './fixtures/fake-runner.ts'
@@ -52,6 +53,44 @@ describe('readBaseline', () => {
   it('fails loudly when the directory is not a git work tree', async () => {
     const runner = fakeRunner([['git rev-parse HEAD', { exitCode: 128, stderr: 'not a git repository' }]])
     await expect(readBaseline(runner, 'D:/nope')).rejects.toThrow(/not a git repository|HEAD/i)
+  })
+})
+
+describe('changedFiles', () => {
+  const HEAD = 'abc123'
+  /**
+   * The three ways a git read lies while looking successful: it was cut off by its
+   * timeout, its capture was truncated, or it exited non-zero. Each one leaves
+   * `stdout` empty or partial, which `reconcile` reads as "no changed file".
+   */
+  const UNTRUSTWORTHY: Array<[string, Partial<CommandResult>]> = [
+    ['a timeout', { exitCode: null, signal: 'SIGTERM', timedOut: true }],
+    ['a truncated capture', { lossy: true, stdout: ' M src/a.cpp\u0000' }],
+    ['a non-zero exit', { exitCode: 128, stderr: 'fatal: not a git repository' }],
+  ]
+
+  it('reads the deduplicated change set from the guarded status and diff', async () => {
+    const runner = fakeRunner([
+      ['git status --porcelain -z', { stdout: ' M src/a.cpp\u0000' }],
+      [`git diff --name-only -z ${HEAD}`, { stdout: 'src/a.cpp\u0000src/b.cpp\u0000' }],
+    ])
+    expect(await changedFiles(runner, 'D:/repo', HEAD)).toEqual(['src/a.cpp', 'src/b.cpp'])
+  })
+
+  it.each(UNTRUSTWORTHY)('refuses a status read with %s instead of reporting an empty tree', async (_name, answer) => {
+    const runner = fakeRunner([
+      ['git status --porcelain -z', answer],
+      [`git diff --name-only -z ${HEAD}`, { stdout: 'src/b.cpp\u0000' }],
+    ])
+    await expect(changedFiles(runner, 'D:/repo', HEAD)).rejects.toThrow(/Cannot read the git status/)
+  })
+
+  it.each(UNTRUSTWORTHY)('refuses a diff read with %s instead of reporting an empty diff', async (_name, answer) => {
+    const runner = fakeRunner([
+      ['git status --porcelain -z', { stdout: ' M src/a.cpp\u0000' }],
+      [`git diff --name-only -z ${HEAD}`, answer],
+    ])
+    await expect(changedFiles(runner, 'D:/repo', HEAD)).rejects.toThrow(/Cannot read the diff against abc123/)
   })
 })
 
@@ -143,6 +182,36 @@ describe('checkoutFiles', () => {
   it('refuses a timed-out listing even though it exited 0', async () => {
     const runner = fakeRunner([['git --literal-pathspecs ls-files -z --', { timedOut: true, stdout: 'src/a.cpp\u0000' }]])
     await expect(checkoutFiles(runner, 'D:/repo', ['src/a.cpp'])).rejects.toThrow(/src\/a\.cpp/)
+  })
+
+  // A mutating command's stdout is a log line, so `lossy` on it is not evidence of
+  // failure — but `timedOut` is: the host reads its own deadline, not the outcome,
+  // and `timedOut: true` is reachable together with `exitCode: 0`. Recording
+  // `rolled_back: true` over a command that was cut off would be a lie in durable
+  // state, so the timeout is refused at each of the three mutating sites.
+  it('refuses a timed-out restore even though it exited 0', async () => {
+    const runner = fakeRunner([
+      ['git --literal-pathspecs ls-files -z --', { stdout: 'src/a.cpp\u0000' }],
+      ['git --literal-pathspecs restore --source=HEAD', { exitCode: 0, timedOut: true }],
+    ])
+    await expect(checkoutFiles(runner, 'D:/repo', ['src/a.cpp'])).rejects.toThrow(/Cannot roll back/)
+  })
+
+  it('refuses a timed-out clean even though it exited 0', async () => {
+    const runner = fakeRunner([
+      ['git --literal-pathspecs ls-files -z --', { stdout: '\u0000' }],
+      ['git --literal-pathspecs clean -f --', { exitCode: 0, timedOut: true }],
+    ])
+    await expect(checkoutFiles(runner, 'D:/repo', ['src/new_helper.cpp'])).rejects.toThrow(/Cannot remove/)
+  })
+})
+
+describe('createBranch', () => {
+  it('refuses a timed-out checkout even though it exited 0', async () => {
+    // `checkout -B` printing a log line and exiting 0 is not proof the branch
+    // exists; the deadline firing means it did not finish.
+    const runner = fakeRunner([['git checkout -B', { exitCode: 0, timedOut: true }]])
+    await expect(createBranch(runner, 'D:/repo', 'clone-refactor/r1')).rejects.toThrow(/Cannot create branch/)
   })
 })
 
