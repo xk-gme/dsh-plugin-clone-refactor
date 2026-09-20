@@ -43,13 +43,24 @@ export interface LedgerRead {
  * the run reports a coverage gap a human can resolve with one `clone_assess`,
  * while the other direction closes the run on a verdict about a different family.
  *
+ * The rule is symmetric, and the missing-pointer case is why. When the run records NO
+ * revision — `<clusters>.scan.json` is gone, so nothing says which cluster set
+ * `clusters.jsonl` holds — a record that DOES carry one cannot be shown to speak about
+ * that set either, so it must not count. Counting every record then re-opened the hole
+ * from the other side: a replaced `clusters.jsonl` with its pointer lost closed the run
+ * on the old verdicts, and `recordAssessment` saw the old stamped verdict as a duplicate
+ * of the new cluster set, so the documented plain re-assess was refused exactly where
+ * coverage was wrongly satisfied. The unstamped legacy record still counts, which is the
+ * behaviour a run with no pointer needs.
+ *
  * That recovery is only real while the WRITE side applies the same rule, which is
  * why {@link recordAssessment} asks this question about the record's own revision
  * rather than about the file: a stale verdict is not a duplicate, so it may be
  * re-recorded plainly.
  */
 export function seenAtRevision(record: { scan_revision?: string }, revision: string | undefined): boolean {
-  if (revision === undefined) return true
+  // One comparison covers both directions: a stamped record matches the revision it was
+  // written under, and only an unstamped record matches a run that records none.
   return record.scan_revision === revision
 }
 
@@ -58,8 +69,9 @@ export function seenAtRevision(record: { scan_revision?: string }, revision: str
  *
  * Passing the current scan `revision` restricts the read to the records of that
  * revision, which is what the coverage contract needs after a refresh. Passing
- * nothing reads the whole file, which is what a run with no recorded revision
- * needs: no record can be shown to be stale.
+ * nothing is the legacy read for a run that recorded no revision at all: only
+ * UNSTAMPED records count, because a stamped one cannot be shown to speak about a
+ * cluster set whose revision nobody wrote down.
  */
 export async function loadAssessments(paths: RunPaths, revision?: string): Promise<LedgerRead> {
   const { records, droppedLines } = await readJsonl<Assessment>(paths.assessments)
@@ -128,7 +140,16 @@ export async function recordAssessment(
   return { replaced }
 }
 
-/** The authorization ledger; a missing file is an empty ledger. */
+/**
+ * The authorization ledger; a missing file is an empty ledger.
+ *
+ * With a `revision`, the patches that still count for it. With NONE, the WHOLE file —
+ * deliberately not `seenAtRevision`'s conservative rule, because the no-revision form is
+ * the read-modify-write one: `clone_assess` upserts and retracts through it and writes
+ * the list back, so filtering stamped records out would DELETE another revision's
+ * authorizations. The coverage contract reads assessments, and that is where the
+ * missing-pointer case has to be conservative (see {@link seenAtRevision}).
+ */
 export async function loadPatches(paths: RunPaths, revision?: string): Promise<PatchRecord[]> {
   const patches = (await readJson<PatchRecord[]>(paths.patches)) ?? []
   return revision === undefined ? patches : patches.filter(patch => seenAtRevision(patch, revision))

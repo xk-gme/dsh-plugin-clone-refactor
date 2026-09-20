@@ -54,9 +54,14 @@ function audit(unauthorized: readonly string[], overrides: Partial<ReconcileAudi
   }
 }
 
-function verifyJob(status: JobRecord['status']): JobRecord {
+/**
+ * The newest VERIFY job record, on its own path from `result.json`. It names the
+ * attempt it settled, because a deleted terminal record is invisible to the job
+ * reader: without the number, the newest job LEFT ON DISK is an earlier attempt's.
+ */
+function verifyJob(status: JobRecord['status'], attempt = 1): JobRecord {
   return {
-    job_id: 'verify-20260920-010000-aaaa', run_id: 'run-1', kind: 'verify', status,
+    job_id: 'verify-20260920-010000-aaaa', run_id: 'run-1', kind: 'verify', status, attempt,
     started_at: '2026-09-20T00:00:00.000Z',
     finished_at: status === 'running' ? null : '2026-09-20T00:10:00.000Z',
     error: null, summary: '',
@@ -271,6 +276,47 @@ describe('submitGate', () => {
     expect(refusal(gate)).toMatch(/No verification job record/)
   })
 
+  it('refuses a verify job that belongs to another attempt', () => {
+    // Attempts 1 and 2 both passed; attempt 2's terminal job record was then lost — a
+    // failed bookkeeping write, or a deleted file, which the job reader cannot see at all
+    // (so not even `unreadable` names it). The newest VERIFY job left on disk is attempt
+    // 1's, and its `succeeded` status used to stand in for attempt 2's. Nothing unsafe
+    // followed (attempt 2's own result.json must still say ok and every set must match),
+    // but the gate's stated invariant — every missing part is a refusal — was violated.
+    const gate = submitGate({
+      attempts: [result(1), result(2)], newestAttempt: 2, audit: audit([]),
+      verifyJob: verifyJob('succeeded', 1),
+      patches: [PATCH], revision: 'rev-1', files: ['module/laws/src/a.cpp'], unreadable: [],
+    })
+    expect(gate.allowed).toBe(false)
+    expect(refusal(gate)).toMatch(/attempt 1/)
+    expect(refusal(gate)).toMatch(/attempt 2/)
+    expect(refusal(gate)).toMatch(/clone_verify/)
+    // Not a rule that refuses everything: the same records with the job of the attempt
+    // the gate is binding are allowed.
+    expect(submitGate({
+      attempts: [result(1), result(2)], newestAttempt: 2, audit: audit([]),
+      verifyJob: verifyJob('succeeded', 2),
+      patches: [PATCH], revision: 'rev-1', files: ['module/laws/src/a.cpp'], unreadable: [],
+    })).toEqual({ allowed: true })
+  })
+
+  it('refuses a verify job that names no attempt at all', () => {
+    // `attempt` is absent on a record written before it existed. A record that cannot
+    // show which attempt it settled must not be read as this one's.
+    const unnamed: JobRecord = {
+      job_id: 'verify-20260920-010000-aaaa', run_id: 'run-1', kind: 'verify', status: 'succeeded',
+      started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      error: null, summary: 'attempt 1: PASS',
+    }
+    const gate = submitGate({
+      attempts: [result(1)], newestAttempt: 1, audit: audit([]), verifyJob: unnamed,
+      patches: [PATCH], revision: 'rev-1', files: ['module/laws/src/a.cpp'], unreadable: [],
+    })
+    expect(gate.allowed).toBe(false)
+    expect(refusal(gate)).toMatch(/does not record which attempt/)
+  })
+
   it('refuses an attempt that carries no record of what it verified', () => {
     // A run from before the record existed must not become silently submittable.
     const gate = submitGate({
@@ -305,6 +351,13 @@ describe('submitGate', () => {
   })
 
   it('refuses an attempt whose own reconcile still lists unauthorized changes', () => {
+    // This case pins a PURE-FUNCTION invariant, not a tool-reachable state: no tool flow
+    // yields a passing `result.json` beside an audit naming unauthorized files, because a
+    // frozen `clone_verify` throws before it ever writes a result. It stays because
+    // `submitGate`'s input domain has to include that ordering — an audit with
+    // unauthorized files beats a passing result — and that ordering is load-bearing now
+    // that the freeze check runs first. It is NOT coverage of the reachable freeze
+    // (`workflow.spec.ts` drives that one through the tools).
     const gate = submitGate({
       attempts: [result(1)], newestAttempt: 1, audit: audit(['module/laws/src/sneaky.cpp']), verifyJob: verifyJob('succeeded'),
       patches: [PATCH], revision: 'rev-1', files: ['module/laws/src/a.cpp'], unreadable: [],

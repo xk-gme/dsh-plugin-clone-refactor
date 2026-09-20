@@ -13,8 +13,17 @@
  * so every reason for refusing it can be tested without a work tree. Its first
  * question — did the newest attempt settle as a pass? — has its own name
  * ({@link newestVerifyOutcome}) because the closing report publishes the same
- * verdict as `verify_ok`: one definition, so the summary a human reads and the gate
- * that refuses a submission cannot disagree.
+ * verdict as `verify_ok`: one definition, so the two cannot disagree about whether
+ * THE NEWEST ATTEMPT passed.
+ *
+ * They can still disagree about the RUN, and saying otherwise was wrong: this
+ * function settles on the newest attempt alone, and the `late` branch below refuses a
+ * ledger that moved after that attempt read it. A patch authorized afterwards
+ * therefore has `verify_ok: true` from a summary that shares this predicate while a
+ * submission is refused. That is why the report publishes TWO facts — `verify_ok` (the
+ * newest attempt's own outcome) and `unverified` (whether every patch the ledger holds
+ * now is covered by the audit that attempt recorded) — rather than deriving one from
+ * the other.
  *
  * Why a recorded fact instead of a re-derivation. The ledger is mutable and the
  * gate runs later than the verification: `clone_assess` can widen a patch, add a
@@ -41,7 +50,12 @@ export interface NewestVerifyInput {
   attempts: readonly VerifyResult[]
   /** The highest attempt DIRECTORY, whether or not it holds a result.json. */
   newestAttempt: number | undefined
-  /** The newest VERIFY job record: the durable terminal status of the newest attempt. */
+  /**
+   * The newest VERIFY job record, which must NAME the newest attempt
+   * ({@link JobRecord.attempt}): the terminal write is on its own path, so a lost one
+   * leaves no file for the reader to miss, and the newest job still on disk is then an
+   * earlier attempt's.
+   */
   verifyJob: JobRecord | undefined
   /** What the newest attempt reconciled, when it recorded it. */
   audit: ReconcileAudit | undefined
@@ -61,8 +75,8 @@ export type NewestVerify =
 
 /**
  * The one definition of "the newest verification attempt is a pass": its DIRECTORY
- * has a readable, ok `result.json`, its verify JOB settled successfully, and it
- * recorded a readable `reconcile.json`.
+ * has a readable, ok `result.json`, its verify JOB settled successfully AND names that
+ * attempt, and it recorded a readable `reconcile.json`.
  *
  * The freeze claim comes first, and from the newest attempt's own record. A frozen
  * `clone_verify` throws before it starts a job, so that attempt has a
@@ -117,6 +131,22 @@ export function newestVerifyOutcome(input: NewestVerifyInput): NewestVerify {
       settled: false,
       reason: `The newest verification job (${input.verifyJob.job_id}) is ${input.verifyJob.status}, not succeeded${input.verifyJob.error === null ? '' : `: ${input.verifyJob.error}`}. `
         + 'A verification with no successful terminal record is not a passing one: re-run clone_verify.',
+    }
+  }
+  // A record's own attempt number, because "the newest verify job on disk" is not the
+  // same claim: a terminal write that never landed leaves NO file, so the reader cannot
+  // report that attempt 2's status is missing — it reports attempt 1's succeeded job,
+  // which then stood in for an attempt nothing recorded. The status above is checked
+  // first because a failed record refuses on its own terms whatever attempt it belongs
+  // to; this closes the case that check cannot see.
+  if (input.verifyJob.attempt !== newestAttempt) {
+    const belongs = input.verifyJob.attempt === undefined
+      ? 'does not record which attempt it settled'
+      : `belongs to attempt ${String(input.verifyJob.attempt)}`
+    return {
+      settled: false,
+      reason: `The newest verification job on record (${input.verifyJob.job_id}) ${belongs}; `
+        + `it cannot show that attempt ${String(newestAttempt)} settled as a pass. Re-run clone_verify.`,
     }
   }
   // A record written before this existed has no timestamp, and one that was only

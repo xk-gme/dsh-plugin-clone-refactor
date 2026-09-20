@@ -2,11 +2,12 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runPaths } from '../src/core/artifacts.ts'
+import { runPaths, writeAtomic } from '../src/core/artifacts.ts'
 import type { JobRecord } from '../src/core/jobs.ts'
 import { resolveSettings } from '../src/config.ts'
 import { renderReport, summarizeReport, writeReport, type ReportInput } from '../src/report/report.ts'
 import type { Assessment, Cluster, PatchRecord, ReconcileAudit, VerifyResult } from '../src/core/schema.ts'
+import { loadUnauthorized, loadVerifyAttempts } from '../src/verify/artifacts.ts'
 
 const cleanups: Array<() => Promise<unknown>> = []
 afterEach(async () => { while (cleanups.length) await cleanups.pop()!() })
@@ -48,10 +49,16 @@ function audit(): ReconcileAudit {
   }
 }
 
-/** The newest VERIFY job record, on its own path from `result.json`. */
-function verifyJob(status: JobRecord['status']): JobRecord {
+/**
+ * The newest VERIFY job record, on its own path from `result.json`.
+ *
+ * It names the attempt it settled, and that number has to match the newest attempt
+ * DIRECTORY: a deleted terminal record is invisible to the job reader, so the newest
+ * job left on disk is an EARLIER attempt's and may not stand in for the newest one.
+ */
+function verifyJob(status: JobRecord['status'], attempt = 1): JobRecord {
   return {
-    job_id: 'verify-20260920-000000-aaaa', run_id: 'run-1', kind: 'verify', status,
+    job_id: 'verify-20260920-000000-aaaa', run_id: 'run-1', kind: 'verify', status, attempt,
     started_at: '2026-09-20T00:00:00.000Z', finished_at: status === 'running' ? null : '2026-09-20T00:10:00.000Z',
     error: null, summary: '',
   }
@@ -76,6 +83,10 @@ function input(overrides: Partial<ReportInput> = {}): ReportInput {
     newestAttempt: undefined,
     verifyJob: undefined,
     audit: undefined,
+    // Every patch this input carries is the one `audit()` reconciled (`C001` at the
+    // audit's own `recorded_at`, under its revision and file set), so the default is
+    // "covered". A test about a patch authorized AFTER the attempt says `false`.
+    patchesCovered: true,
     job: undefined,
     droppedLines: [],
     unauthorized: [],
@@ -163,7 +174,7 @@ describe('renderReport', () => {
     // tells a human not to commit work the tooling accepts.
     const recovered = input({
       verify: [outcome(1, false), outcome(2, true)], assessments: complete,
-      newestAttempt: 2, verifyJob: verifyJob('succeeded'), audit: audit(),
+      newestAttempt: 2, verifyJob: verifyJob('succeeded', 2), audit: audit(),
     })
     expect(summarizeReport(recovered).verify_ok).toBe(true)
     expect(renderReport(recovered)).toContain('验证 attempts: 2（最新一次 ok: true）')
@@ -172,7 +183,7 @@ describe('renderReport', () => {
     // "newest" cannot be satisfied by "some attempt passed".
     const regressed = input({
       verify: [outcome(1, true), outcome(2, false)], assessments: complete,
-      newestAttempt: 2, verifyJob: verifyJob('failed'), audit: audit(),
+      newestAttempt: 2, verifyJob: verifyJob('failed', 2), audit: audit(),
     })
     expect(summarizeReport(regressed).verify_ok).toBe(false)
     expect(renderReport(regressed)).toContain('有已 patch 的簇没有通过的验证')
@@ -193,7 +204,7 @@ describe('renderReport', () => {
     })
     const newestHasNoResult = input({
       verify: [outcome(1, true)], assessments: complete,
-      newestAttempt: 2, verifyJob: verifyJob('succeeded'), audit: audit(),
+      newestAttempt: 2, verifyJob: verifyJob('succeeded', 2), audit: audit(),
     })
     expect(summarizeReport(newestHasNoResult).verify_ok).toBe(false)
     expect(summarizeReport(newestHasNoResult).unverified).toBe(true)
@@ -217,6 +228,78 @@ describe('renderReport', () => {
     })
     expect(summarizeReport(noReconcile).verify_ok).toBe(false)
     expect(summarizeReport(noReconcile).unverified).toBe(true)
+  })
+
+  it('warns about a patch the newest attempt never covered, while still reporting that attempt as passed', () => {
+    // The reproduced state: attempt 1 PASSED for C001, and then `clone_assess C002
+    // patched` authorized a second cluster — the flow `clone_submit`'s own description
+    // names ("a patch authorized after it"). `verify_ok` is a fact about the NEWEST
+    // ATTEMPT, and that attempt genuinely passed, so a summary that derived "nothing is
+    // unverified" from it alone printed no warning about a patch no build ever saw
+    // while `clone_submit` refused the same ledger (`late`). The warning text is
+    // "有已 patched 的簇没有通过的验证", and C002 is exactly such a cluster.
+    const complete = new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'patched')]])
+    const attempt: VerifyResult = {
+      attempt: 1, ok: true, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      rolled_back: false, rollback_files: [], steps: [],
+    }
+    const afterTheAttempt = input({
+      verify: [attempt], assessments: complete,
+      newestAttempt: 1, verifyJob: verifyJob('succeeded'), audit: audit(),
+      patchesCovered: false,
+    })
+    // Both facts, and neither is the other's opposite: the newest attempt passed AND a
+    // current patch is uncovered. Reporting `ok: false` here would be the opposite lie.
+    expect(summarizeReport(afterTheAttempt).verify_ok).toBe(true)
+    expect(summarizeReport(afterTheAttempt).unverified).toBe(true)
+    expect(renderReport(afterTheAttempt)).toContain('验证 attempts: 1（最新一次 ok: true）')
+    expect(renderReport(afterTheAttempt)).toContain('有已 patch 的簇没有通过的验证')
+
+    // The same passing attempt with every current patch covered carries no warning.
+    const covered = input({
+      verify: [attempt], assessments: complete,
+      newestAttempt: 1, verifyJob: verifyJob('succeeded'), audit: audit(),
+      patchesCovered: true,
+    })
+    expect(summarizeReport(covered).verify_ok).toBe(true)
+    expect(summarizeReport(covered).unverified).toBe(false)
+    expect(renderReport(covered)).not.toContain('有已 patch 的簇没有通过的验证')
+  })
+
+  it('labels the resolved-freeze sentence with the newest attempt DIRECTORY, not the newest readable result', async () => {
+    // Three attempt directories, and only attempt 1 wrote a `result.json`: attempt 2 was
+    // killed mid-build and the newest attempt (3) recorded its reconcile and nothing
+    // else. The durable sentence named `input.verify.at(-1)?.attempt` — the newest
+    // READABLE result — so a run whose newest reconcile is attempt 3 told the operator
+    // that attempt 1's reconcile had resolved the older freeze.
+    const target = await paths()
+    await writeAtomic(join(target.verifyDir, '1', 'result.json'), `${JSON.stringify({
+      attempt: 1, ok: false, started_at: '2026-09-20T01:00:00.000Z', finished_at: '2026-09-20T01:10:00.000Z',
+      rolled_back: false, rollback_files: [], steps: [],
+    } satisfies VerifyResult)}\n`)
+    await writeAtomic(join(target.verifyDir, '1', 'reconcile.json'), `${JSON.stringify({
+      ...audit(), changed: ['module/laws/src/a.cpp', 'module/laws/src/sneaky.cpp'],
+      unauthorized: ['module/laws/src/sneaky.cpp'],
+    })}\n`)
+    // Attempt 2 owns its directory with a step log and no result at all.
+    await writeAtomic(join(target.verifyDir, '2', '1-build.log'), 'killed mid-build\n')
+    await writeAtomic(join(target.verifyDir, '3', 'reconcile.json'), `${JSON.stringify(audit())}\n`)
+
+    const verify = await loadVerifyAttempts(target)
+    const status = await loadUnauthorized(target)
+    // The fixture is what makes the two numbers disagree, so it is asserted rather
+    // than assumed: one readable result, and a newest directory of 3.
+    expect(verify.map(attempt => attempt.attempt)).toEqual([1])
+    expect(status.newestAttempt).toBe(3)
+    expect(status.resolved).toEqual(['module/laws/src/sneaky.cpp'])
+    const text = renderReport(input({
+      verify,
+      assessments: new Map([['C001', assessment('C001', 'report_only')], ['C002', assessment('C002', 'report_only')]]),
+      newestAttempt: status.newestAttempt, audit: status.newestAudit, verifyJob: verifyJob('succeeded', 3),
+      unauthorized: status.files, resolvedUnauthorized: status.resolved,
+    }))
+    expect(text).toContain('最新一次 reconcile（attempt 3）')
+    expect(text).not.toContain('attempt 1）已不含它们')
   })
 
   it('keeps a row intact when a reason carries a pipe or a newline', () => {

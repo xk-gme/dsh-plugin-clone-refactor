@@ -292,8 +292,9 @@ describe('the artifact field lists in the two setup docs', () => {
       },
       clusters: [], assessments: new Map(), patches: [], verify: [],
       // The submit gate's inputs for the newest attempt: this run has none, so
-      // `verify_ok` is false rather than unstated.
-      newestAttempt: undefined, verifyJob: undefined, audit: undefined,
+      // `verify_ok` is false rather than unstated — and there is no patch for an audit
+      // to cover, so the coverage half of "nothing patched is unverified" is vacuous.
+      newestAttempt: undefined, verifyJob: undefined, audit: undefined, patchesCovered: false,
       job: undefined,
       droppedLines: [], unauthorized: [], resolvedUnauthorized: [],
       unreadableRecords: [], missingReconcileAttempt: undefined,

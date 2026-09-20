@@ -25,6 +25,18 @@ export interface JobRecord {
   finished_at: string | null
   error: string | null
   summary: string
+  /**
+   * The verification attempt this job settled, on a VERIFY job. Absent on a SCAN job,
+   * and on a record written before the field existed.
+   *
+   * The submit gate requires the newest verify job to name the newest attempt, because
+   * a lost terminal write is invisible to the job reader: the newest job left on disk is
+   * then the attempt BEFORE this one, and its `succeeded` status stood in for an attempt
+   * nothing recorded. The number lives on the record rather than in `summary` — the
+   * summary is rendered text, and it is legitimately empty when its rendering throws,
+   * which is exactly the run a gate keyed on parsed prose would have to refuse.
+   */
+  attempt?: number
 }
 
 /** `<kind>-<YYYYMMDD-HHMMSS>-<4 hex>`: sortable, and obvious in a directory listing. */
@@ -56,8 +68,22 @@ export async function saveJob(paths: RunPaths, job: JobRecord): Promise<void> {
   await writeAtomic(jobFile(paths, job.job_id), `${JSON.stringify(job, null, 2)}\n`)
 }
 
-/** Record a job as running before its work starts. */
-export async function startJob(paths: RunPaths, runId: string, kind: JobKind, now: Date = new Date()): Promise<JobRecord> {
+/**
+ * Record a job as running before its work starts.
+ *
+ * `attempt` is the verification attempt this job settles and is passed only by
+ * `clone_verify`, which knows the number before the job starts. It is written as an
+ * ABSENT key for a scan rather than as `undefined`, so the documented job-record field
+ * list (`docs.spec.ts` reads it off a scan record) keeps describing every record a scan
+ * writes.
+ */
+export async function startJob(
+  paths: RunPaths,
+  runId: string,
+  kind: JobKind,
+  now: Date = new Date(),
+  attempt?: number,
+): Promise<JobRecord> {
   const job: JobRecord = {
     job_id: newJobId(kind, now),
     run_id: runId,
@@ -67,6 +93,7 @@ export async function startJob(paths: RunPaths, runId: string, kind: JobKind, no
     finished_at: null,
     error: null,
     summary: '',
+    ...(attempt === undefined ? {} : { attempt }),
   }
   await saveJob(paths, job)
   return job
@@ -146,6 +173,13 @@ export async function latestJob(
  * that failed a required step but could not write its result still leaves this
  * record failed, and a submit gate that read only `result.json` saw the older,
  * passing attempt and accepted it.
+ *
+ * "Newest by start time" is not by itself the newest ATTEMPT's job: a terminal write
+ * that never landed leaves no file at all, so nothing here can see that this run has
+ * two attempts and only one job record. `src/verify/gate.ts` requires the record it is
+ * handed to NAME the attempt it is binding; this reader deliberately stays a plain
+ * newest-wins read rather than searching for a record that agrees, so a lost terminal
+ * write is refused instead of papered over by an earlier attempt's record.
  */
 export async function latestVerifyJob(
   paths: RunPaths,

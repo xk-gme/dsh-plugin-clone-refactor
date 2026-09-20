@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runPaths } from '../src/core/artifacts.ts'
-import { detach, finishJob, latestJob, loadJob, newJobId, startJob, type JobRecord } from '../src/core/jobs.ts'
+import { detach, finishJob, latestJob, latestVerifyJob, loadJob, newJobId, startJob, type JobRecord } from '../src/core/jobs.ts'
 
 const cleanups: Array<() => Promise<unknown>> = []
 afterEach(async () => { while (cleanups.length) await cleanups.pop()!() })
@@ -125,6 +125,49 @@ describe('job records', () => {
     const unreadable: string[] = []
     expect((await latestJob(target, name => { unreadable.push(name) }))?.job_id).toBe(good.job_id)
     expect(unreadable).toEqual([notARecord])
+  })
+})
+
+describe('latestVerifyJob', () => {
+  it('carries the attempt a verify job settled, through the terminal write', async () => {
+    // The terminal record is the durable status a submit gate binds a verification to,
+    // but a `JobRecord` named no attempt: the newest verify job by start time was taken
+    // for "its verify job", so a deleted terminal write left the attempt BEFORE the
+    // newest one standing in for it. The attempt number has to be ON the record, and it
+    // has to survive `finishJob` — that write is the one the gate reads.
+    const target = await paths()
+    const job = await startJob(target, 'run-1', 'verify', new Date('2026-09-20T01:00:00Z'), 2)
+    expect(job.attempt).toBe(2)
+    const finished = await finishJob(target, job, 'succeeded', null, 'attempt 2: PASS')
+    expect(finished.attempt).toBe(2)
+    expect((await loadJob(target, job.job_id))?.attempt).toBe(2)
+    expect((await latestVerifyJob(target))?.attempt).toBe(2)
+
+    // A scan settles no attempt, so its record does not grow a field a scan never has:
+    // the documented job-record field list is asserted field-by-field against a scan
+    // record (`docs.spec.ts`), and a field that is always present would have to be
+    // documented for every job.
+    const scan = await startJob(target, 'run-1', 'scan', new Date('2026-09-20T02:00:00Z'))
+    expect(scan.attempt).toBeUndefined()
+    expect(Object.hasOwn(scan, 'attempt')).toBe(false)
+  })
+
+  it('leaves the attempt of an older record for the reader to see', async () => {
+    // Two attempts, oldest first, so the newest verify job really is the newest
+    // attempt's — and the reader still reports the older record's own number rather
+    // than reusing it for the newest one.
+    const target = await paths()
+    const first = await startJob(target, 'run-1', 'verify', new Date('2026-09-20T01:00:00Z'), 1)
+    const second = await startJob(target, 'run-1', 'verify', new Date('2026-09-20T02:00:00Z'), 2)
+    await finishJob(target, first, 'succeeded', null, 'attempt 1: PASS')
+    await finishJob(target, second, 'succeeded', null, 'attempt 2: PASS')
+    expect((await latestVerifyJob(target))?.job_id).toBe(second.job_id)
+    // Delete the newest attempt's terminal record: the reader now reports the OLDER
+    // attempt's job, whose attempt number is what lets a gate refuse it.
+    await rm(join(target.dir, 'jobs', `${second.job_id}.json`), { force: true })
+    const survived = await latestVerifyJob(target)
+    expect(survived?.job_id).toBe(first.job_id)
+    expect(survived?.attempt).toBe(1)
   })
 })
 

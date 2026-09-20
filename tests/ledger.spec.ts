@@ -77,6 +77,48 @@ describe('assessments', () => {
     expect(droppedLines).toEqual([])
   })
 
+  it('counts only UNSTAMPED records while the run records no revision', async () => {
+    // The pointer file is named by `saveJsonlClusters`, and the revision filter used to
+    // read the WHOLE file when that pointer was absent (`revision === undefined`). That
+    // state is reachable two ways: `clusters.jsonl` was replaced and the pointer write
+    // that should have followed never landed, or the pointer file was deleted. Reading
+    // every record then paired a NEW cluster set with the OLD verdict text and closed
+    // the run with `gaps: []`.
+    //
+    // A record stamped with SOME revision cannot be shown to speak about a cluster set
+    // whose revision is unknown, so it must not count. The unstamped legacy record still
+    // counts — that is the documented behaviour a run with no pointer needs — so both
+    // directions are asserted here, in one test that is red on the whole-file read.
+    const target = await paths()
+    await recordAssessment(target, { ...assessment('C001', 'report_only'), scan_revision: 'rev-1' }, { replace: false })
+    await recordAssessment(target, assessment('C002', 'skipped'), { replace: false })
+    const { latest, history } = await loadAssessments(target)
+    expect([...latest.keys()]).toEqual(['C002'])
+    expect(history.map(record => record.cluster_id)).toEqual(['C002'])
+    // The conservative direction, spelled out: the new cluster set reports the stamped
+    // cluster as a gap a human has to resolve.
+    expect(coverageGaps(['C001', 'C002'], latest)).toEqual(['C001'])
+  })
+
+  it('lets a plain re-assess speak for a run whose revision pointer is gone', async () => {
+    // With the pointer deleted, `clone_assess` finds no revision and stamps nothing, so
+    // `recordAssessment` asks about `undefined`. Reading the whole file made the OLD
+    // stamped verdict a duplicate and refused with "'C001' already has a verdict for
+    // this scan revision" — the documented recovery after a rescan was unavailable
+    // exactly where the coverage contract had already stopped counting that verdict.
+    const target = await paths()
+    await recordAssessment(target, { ...assessment('C001', 'report_only'), scan_revision: 'rev-1' }, { replace: false })
+    const re = await recordAssessment(target, assessment('C001', 'skipped'), { replace: false })
+    expect(re.replaced).toBe(false)
+    const { latest } = await loadAssessments(target)
+    expect(latest.get('C001')?.verdict).toBe('skipped')
+    // And the write side now agrees with this read side: the verdict just written is an
+    // unstamped record of the (unknown) current revision, so a second plain one is a
+    // genuine duplicate and still needs `replace: true`.
+    await expect(recordAssessment(target, assessment('C001', 'report_only'), { replace: false }))
+      .rejects.toThrow(/already has a verdict/)
+  })
+
   it('round-trips the evidence a verdict was recorded with', async () => {
     const target = await paths()
     const evidence = { file: 'module/laws/src/a.cpp', line: 12, snippet: 'virtual void draw();' }

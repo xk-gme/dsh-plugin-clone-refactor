@@ -11,7 +11,7 @@ import { detach, latestJob, latestVerifyJob, startJob, type PersistFailure } fro
 import { normalizePath } from './core/paths.ts'
 import { newRunId } from './core/artifacts.ts'
 import { openRun, requireRun, saveRun } from './core/run.ts'
-import { requireText, VERDICTS, type Assessment, type PatchRecord } from './core/schema.ts'
+import { requireText, VERDICTS, type Assessment, type PatchRecord, type ReconcileAudit } from './core/schema.ts'
 import { csvDetector } from './detect/csv.ts'
 import { pythonDetector } from './detect/python.ts'
 import { changedFiles, checkoutFiles } from './git/baseline.ts'
@@ -94,6 +94,35 @@ async function currentLedger(paths: import('./core/artifacts.ts').RunPaths) {
  */
 function authorizedFiles(patches: readonly PatchRecord[]): string[] {
   return [...new Set(patches.flatMap(patch => patch.files_changed.map(normalizePath)))].sort()
+}
+
+/**
+ * Whether the newest settled audit covers every patch the ledger authorizes NOW.
+ *
+ * `verify_ok` reports the newest attempt, and the newest attempt can genuinely have
+ * passed while the ledger it would be submitted under moved afterwards: a `patched`
+ * verdict recorded later rides on that pass without ever being built or tested, which
+ * is exactly the ledger `clone_submit` refuses in its `late` branch. A summary that
+ * derived "nothing is unverified" from `verify_ok` alone therefore printed no warning
+ * about a patch no verification saw.
+ *
+ * Every clause is the gate's own comparison for one patch, plus a SUBSET test on the
+ * files rather than the gate's set equality: a retraction shrinks the ledger, and the
+ * patches that remain are still covered by the attempt that verified them. An audit that
+ * cannot show what it verified or when (no timestamp, no cluster set) covers nothing —
+ * the same conservative direction `newestVerifyOutcome` takes.
+ */
+function everyPatchCovered(
+  patches: readonly PatchRecord[],
+  audit: ReconcileAudit | undefined,
+  revision: string | undefined,
+): boolean {
+  if (audit === undefined || typeof audit.recorded_at !== 'string' || !Array.isArray(audit.cluster_ids)) return false
+  return patches.every(patch =>
+    patch.recorded_at <= audit.recorded_at
+    && audit.scan_revision === revision
+    && audit.cluster_ids.includes(patch.cluster_id)
+    && patch.files_changed.map(normalizePath).every(file => audit.authorized.includes(file)))
 }
 
 export function registerTools(ctx: Context, settings: Settings, runner: import('./core/command.ts').CommandRunner, artifactsRoot: string): void {
@@ -391,7 +420,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         const freshNote = fresh.length === 0 ? '' : ` Revert ${fresh.join(', ')} or record a patched verdict that lists ${fresh.length === 1 ? 'it' : 'them'}.`
         throw new Error(`UNAUTHORIZED_CHANGES: ${audit.unauthorized.join(', ')} changed but is not in the authorization ledger. This run is frozen: resolve each file before verifying or submitting.${staleNote}${freshNote}`)
       }
-      const job = await startJob(paths, runId, 'verify')
+      const job = await startJob(paths, runId, 'verify', new Date(), attempt)
       detach(paths, job, async () => {
         const result = await runVerification({ runner, paths, steps: settings.verify.steps, cwd: record.project_root, attempt, signal: undefined })
         const resultPath = join(paths.verifyDir, String(attempt), 'result.json')
@@ -505,8 +534,9 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       const { paths, record } = await requireRun(artifactsRoot, runId)
       // One revision-consistent view of the run: the clusters, the verdicts and the
       // authorizations must all belong to the same scan revision, or the closing
-      // report pairs a new cluster with an old cluster's verdict text.
-      const { clusters, latest, droppedLines, patches } = await currentLedger(paths)
+      // report pairs a new cluster with an old cluster's verdict text. `revision` is
+      // also one clause of the coverage claim below.
+      const { clusters, latest, droppedLines, patches, revision } = await currentLedger(paths)
       // Every durable record is read through the visible-skip hook: a corrupt file is
       // reported by name rather than dropped. Without it a corrupt NEWEST job record
       // made this report present an older job as the run's last one.
@@ -531,6 +561,10 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       const written = await writeReport(paths, {
         run: record, clusters, assessments: latest, patches, verify,
         newestAttempt: unauthorized.newestAttempt, verifyJob, audit: unauthorized.newestAudit,
+        // The half of "no patched cluster is unverified" that `verify_ok` cannot state:
+        // it is about the newest attempt, and a patch recorded after that attempt is
+        // still authorized while nothing ever built it.
+        patchesCovered: everyPatchCovered(patches, unauthorized.newestAudit, revision),
         job, droppedLines,
         unauthorized: unauthorized.files,
         resolvedUnauthorized: unauthorized.resolved,

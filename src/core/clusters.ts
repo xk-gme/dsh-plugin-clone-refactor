@@ -9,20 +9,31 @@ export function scanRevisionPath(paths: RunPaths): string {
 }
 
 /**
- * Record the scan revision `clusters.jsonl` now belongs to.
+ * Record the clusters of one scan, and the revision they belong to.
  *
- * A verdict or authorization record stamped with an older revision is invisible to
- * the coverage contract and to `clone_verify` (see `seenAtRevision`). The revision
- * is kept beside the clusters rather than inside them so that appending to
- * `clusters.jsonl` stays impossible and one scan stays one atomic pair of writes.
+ * The revision pointer is written FIRST, on purpose. A scan replaces both files and no
+ * rename makes the pair atomic, so a failure BETWEEN them has to leave the conservative
+ * pair: a new revision with the OLD cluster set. Every verdict or authorization stamped
+ * with the previous revision then stops counting (`seenAtRevision`), so the run reports
+ * gaps a human resolves with one `clone_assess` — the direction that cannot close a run
+ * on a verdict that is not there.
+ *
+ * The other order leaves the harmful pair, and it was the shipped one: a NEW cluster set
+ * under the OLD revision, which is indistinguishable from a legitimate scan as far as
+ * every reader is concerned. `clone_report` then closed while pairing the new cluster's
+ * files with the old cluster's verdict text, and no reader could tell.
+ *
+ * Two files rather than one, because the revision is kept beside the clusters rather
+ * than inside them: appending to `clusters.jsonl` stays impossible, and one scan stays a
+ * pair of writes rather than a read-modify-write.
  */
 export async function saveJsonlClusters(
   paths: RunPaths,
   clusters: readonly Cluster[],
   revision?: string,
 ): Promise<void> {
-  await writeAtomic(paths.clusters, clusters.map(cluster => `${JSON.stringify(cluster)}\n`).join(''))
   if (revision !== undefined) await writeAtomic(scanRevisionPath(paths), `${JSON.stringify({ revision }, null, 2)}\n`)
+  await writeAtomic(paths.clusters, clusters.map(cluster => `${JSON.stringify(cluster)}\n`).join(''))
 }
 
 export async function loadJsonlClusters(paths: RunPaths): Promise<Cluster[]> {

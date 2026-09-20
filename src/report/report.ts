@@ -32,6 +32,25 @@ export interface ReportInput {
   newestAttempt: number | undefined
   verifyJob: JobRecord | undefined
   audit: ReconcileAudit | undefined
+  /**
+   * Whether EVERY patch the ledger authorizes right now is covered by the newest
+   * settled audit: recorded no later than its reconcile, under the run's current scan
+   * revision, by a cluster that attempt reconciled, with every file of the patch in the
+   * set it authorized.
+   *
+   * Computed where `clone_report` assembles its inputs, because it needs the run's
+   * current revision and the audit's authorized set and neither belongs to this
+   * interface for any other reason. Required rather than optional: a report that has to
+   * DERIVE "nothing is unverified" cannot state the fact, and `verify_ok` alone is not
+   * it. `verify_ok` is about the newest attempt only, so a patch authorized AFTER that
+   * attempt rides on an attempt that genuinely passed while the patch itself was never
+   * built or tested — the ledger `clone_submit` refuses in its `late` branch.
+   *
+   * A subset test, never the gate's set EQUALITY: retracting one authorization leaves
+   * the remaining patches covered, and `unverified`'s warning ("有已 patched 的簇没有通过的
+   * 验证") would be a false statement about them if a shrunk ledger counted as uncovered.
+   */
+  patchesCovered: boolean
   job: JobRecord | undefined
   droppedLines: readonly number[]
   /**
@@ -91,10 +110,16 @@ export function summarizeReport(input: ReportInput): ReportSummary {
     unauthorized_files: [...new Set(input.unauthorized)].sort(),
     resolved_unauthorized_files: [...new Set(input.resolvedUnauthorized)].sort(),
     unreadable_records: [...new Set(input.unreadableRecords)].sort(),
-    // A patched cluster whose verification never completed is not a success, and
-    // the summary has to say so whether the attempt failed or the job's terminal
-    // record never landed: `running` means "no terminal record", not "interrupted".
-    unverified: base.patched > 0 && !base.verify_ok,
+    // A patched cluster whose verification never completed is not a success, and the
+    // summary has to say so whether the attempt failed or the job's terminal record
+    // never landed: `running` means "no terminal record", not "interrupted".
+    //
+    // Coverage is the second half, and it is not `verify_ok`'s negation. `verify_ok` is a
+    // fact about the newest attempt ONLY: a patch authorized after it leaves that attempt
+    // genuinely passed (reporting `ok: false` would be the opposite lie) while the patch
+    // was never built or tested — the ledger `clone_submit` refuses. Both facts are
+    // published; neither implies the other.
+    unverified: base.patched > 0 && !(base.verify_ok && input.patchesCovered),
     dropped_lines: input.droppedLines.length,
   }
 }
@@ -304,8 +329,12 @@ export function renderReport(input: ReportInput): string {
     // The freeze claim comes from the NEWEST reconcile audit, so an earlier finding
     // the newest attempt no longer repeats is history, not the run's state. Printing
     // it under the frozen heading made a finished, submitted run read as frozen.
+    //
+    // "The newest reconcile" is the newest attempt DIRECTORY (`input.newestAttempt`),
+    // not `input.verify.at(-1)` — that is the newest READABLE result.json, so a run
+    // whose newest reconcile is attempt 3 was told attempt 1's had resolved things.
     lines.push('## 已解决的冻结 / Resolved freeze', '',
-      `- 较早的尝试发现这些文件被改动但未授权；最新一次 reconcile（attempt ${input.verify.at(-1)?.attempt ?? '-'}）已不含它们，**本 run 未被冻结**：`,
+      `- 较早的尝试发现这些文件被改动但未授权；最新一次 reconcile（attempt ${input.newestAttempt ?? '-'}）已不含它们，**本 run 未被冻结**：`,
       ...summary.resolved_unauthorized_files.map(file => `  - \`${file}\``), '')
   }
   if (input.job !== undefined) {

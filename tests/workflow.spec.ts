@@ -1554,6 +1554,32 @@ describe('the submit gate is bound to the verification it claims', () => {
     expect(await readFile(join(paths.verifyDir, '2', '1-build.log'), 'utf8'))
       .toBe('attempt two, killed mid-build\n')
   })
+
+  it('refuses when the newest attempt\'s own verify job record is gone', async () => {
+    // Attempt 2 PASSED, and then its terminal job record was lost — a bookkeeping write
+    // that never landed, or a deleted file. A missing file is invisible to the job reader,
+    // so nothing names it (not even `unreadable`) and the newest VERIFY job left on disk
+    // is attempt 1's: its `succeeded` status stood in for attempt 2's, and the gate's own
+    // stated invariant — every missing part is a refusal — was violated. Nothing unsafe
+    // followed, because attempt 2's own result.json still has to say ok — but "not unsafe
+    // today" is not the invariant.
+    const { root, ctx, runner } = await verifiedRun()
+    const { runPaths } = await import('../src/core/artifacts.ts')
+    const paths = runPaths(join(root, 'runs'), 'r1')
+    const second = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((second as { isError?: boolean }).isError, rendered(second)).not.toBe(true)
+    const jobId = (JSON.parse(rendered(second)) as { job_id: string }).job_id
+    await settle(ctx, 'r1')
+    expect((JSON.parse(await readFile(join(paths.verifyDir, '2', 'result.json'), 'utf8')) as { ok: boolean }).ok).toBe(true)
+
+    await rm(join(paths.dir, 'jobs', `${jobId}.json`), { force: true })
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError, rendered(submitted)).toBe(true)
+    // The refusal names the attempt whose record cannot be found, not the one that is left.
+    expect(rendered(submitted)).toMatch(/attempt 2/)
+    expect(rendered(submitted)).toMatch(/clone_verify/)
+    expect(gitVerbsOf(runner)).not.toContain('commit')
+  })
 })
 
 describe('a damaged verification record stays visible instead of fatal', () => {
@@ -1853,5 +1879,222 @@ describe('the summary is the submit gate\'s own newest attempt', () => {
     const refusal = rendered(submitted)
     expect(refusal).toMatch(/frozen/)
     expect(refusal).toContain(SNEAKY)
+  })
+})
+
+describe('the newest attempt and the coverage of every patch are two facts', () => {
+  const STEPS = { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] }
+  const FIRST_FILE = 'module/laws/src/a.cpp'
+  const SECOND_FILE = 'module/laws/src/y.cpp'
+
+  /** The two clusters of the CSV below, each with the file a patch of it would touch. */
+  const CLUSTER_FILE: ReadonlyArray<{ cluster: string, file: string }> = [
+    { cluster: 'C001', file: FIRST_FILE },
+    { cluster: 'C002', file: SECOND_FILE },
+  ]
+
+  /** A `patched` verdict for every cluster whose file the caller names. */
+  async function assessPatched(ctx: Context, files: readonly string[]): Promise<void> {
+    for (const { cluster, file } of CLUSTER_FILE) {
+      if (!files.includes(file)) continue
+      const assessed = await call(ctx, 'clone_assess', {
+        run_id: 'r1', cluster_id: cluster, verdict: 'patched', priority: 'P0',
+        reason: `extracted the computation ${cluster} duplicates`,
+        files_changed: [file],
+        evidence: { file, line: 12, snippet: 'static int area(const Rect& r)' },
+        confirm: true,
+      })
+      expect((assessed as { isError?: boolean }).isError, rendered(assessed)).not.toBe(true)
+    }
+  }
+
+  /**
+   * A run that reached a PASSING attempt 1 with exactly `files` authorized: two clusters
+   * scanned, a `patched` verdict for each file the caller names, then `clone_verify`.
+   */
+  async function passingAttempt(files: readonly string[]): Promise<{ root: string, ctx: Context, runner: ReturnType<typeof fakeRunner> }> {
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,${FIRST_FILE},ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`
+      + `p2,${SECOND_FILE},DrawShape,50-60,module/laws/src/z.cpp,PaintShape,70-80,0.88,type12\n`)
+    // The reconcile's answer is exactly the ledger the caller authorized, so attempt 1
+    // verifies those files and nothing is frozen.
+    const status = files.map(file => ` M ${file}\u0000`).join('')
+    const diff = files.map(file => `${file}\u0000`).join('')
+    const runner = fakeRunner([
+      ['git checkout -B', { stdout: '' }],
+      ['git rev-parse --abbrev-ref HEAD', { stdout: 'clone-refactor/r1\n' }],
+      // First-match-wins, and each array rests on its last entry: the baseline read is
+      // clean, every later reconcile sees the patch.
+      ['git status --porcelain', [{ stdout: '' }, { stdout: status }]],
+      ['git diff --name-only -z abc123', [{ stdout: '' }, { stdout: diff }]],
+      ...GIT_OK,
+      ['msbuild', { stdout: 'Build succeeded\n' }],
+      ['git add', {}],
+      ['git commit', {}],
+    ])
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true, maxClusters: 2 },
+      verify: STEPS,
+      submit: { mode: 'commit' },
+    }, runner)
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    await assessPatched(ctx, files)
+    const verified = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((verified as { isError?: boolean }).isError, rendered(verified)).not.toBe(true)
+    await settle(ctx, 'r1')
+    expect((JSON.parse(await readFile(join(root, 'runs', 'r1', 'verify', '1', 'result.json'), 'utf8')) as { ok: boolean }).ok).toBe(true)
+    return { root, ctx, runner }
+  }
+
+  /**
+   * Wait until wall-clock time is strictly past a durable timestamp. Two ISO stamps in
+   * the same millisecond would make "authorized AFTER the verification" untestable, so
+   * the ordering these tests are about is established rather than hoped for.
+   */
+  async function waitPast(stamp: string): Promise<void> {
+    while (new Date().toISOString() <= stamp) await new Promise(resolve => setTimeout(resolve, 5))
+  }
+
+  /** The durable timestamp of attempt 1's reconcile: what a later patch is compared to. */
+  async function attemptOneReconciledAt(root: string): Promise<string> {
+    return (JSON.parse(await readFile(join(root, 'runs', 'r1', 'verify', '1', 'reconcile.json'), 'utf8')) as { recorded_at: string }).recorded_at
+  }
+
+  it('reports a patch authorized after the passing attempt, while the attempt itself stays ok', async () => {
+    const { root, ctx, runner } = await passingAttempt([FIRST_FILE])
+    // The flow `clone_submit`'s own description names: a patch authorized after the
+    // verification it would be submitted under.
+    await waitPast(await attemptOneReconciledAt(root))
+    const second = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C002', verdict: 'patched', priority: 'P0',
+      reason: 'the extracted helper is shared with y.cpp', files_changed: [SECOND_FILE],
+      evidence: { file: SECOND_FILE, line: 52, snippet: 'return area(r);' },
+      confirm: true,
+    })
+    expect((second as { isError?: boolean }).isError, rendered(second)).not.toBe(true)
+
+    // The gate reads the same three records and refuses: the two artefacts disagreed.
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError, rendered(submitted)).toBe(true)
+    expect(rendered(submitted)).toMatch(/authorized after the verification/)
+    expect(gitVerbsOf(runner)).not.toContain('commit')
+
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError, rendered(reported)).not.toBe(true)
+    const summary = JSON.parse(await readFile(join(root, 'runs', 'r1', 'summary.json'), 'utf8')) as {
+      patched: number, verify_ok: boolean, unverified: boolean
+    }
+    expect(summary.patched).toBe(2)
+    // Both facts, and neither is the other's opposite: the newest attempt genuinely
+    // passed, AND a patch the ledger currently holds was never built or tested. Reporting
+    // `ok: false` would be the opposite lie; reporting nothing at all was this defect.
+    expect(summary.verify_ok).toBe(true)
+    expect(summary.unverified).toBe(true)
+    const report = await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')
+    expect(report).toContain('验证 attempts: 1（最新一次 ok: true）')
+    expect(report).toContain('有已 patch 的簇没有通过的验证')
+  })
+
+  it('carries no warning when every patch the ledger holds is the one the attempt verified', async () => {
+    const { root, ctx } = await passingAttempt([FIRST_FILE])
+    // The second cluster is judged after the attempt, but NOT patched: the ledger still
+    // holds exactly what attempt 1 reconciled, so there is no unverified patch.
+    const second = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C002', verdict: 'report_only', priority: 'P1',
+      reason: 'the two shapes differ, but the base class owns the state both use',
+      evidence: { file: SECOND_FILE, line: 52, snippet: 'void Shape::draw(const Target& t)' },
+    })
+    expect((second as { isError?: boolean }).isError, rendered(second)).not.toBe(true)
+
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError, rendered(reported)).not.toBe(true)
+    const summary = JSON.parse(await readFile(join(root, 'runs', 'r1', 'summary.json'), 'utf8')) as {
+      patched: number, verify_ok: boolean, unverified: boolean
+    }
+    expect(summary.patched).toBe(1)
+    expect(summary.verify_ok).toBe(true)
+    expect(summary.unverified).toBe(false)
+    expect(await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')).not.toContain('有已 patch 的簇没有通过的验证')
+  })
+
+  it('carries no warning after a retraction, where that warning\'s text would be false', async () => {
+    // Attempt 1 verified BOTH files, and the operator then retracts C002 (R49 drops its
+    // authorization). One current patch remains, and that patch passed verification, so
+    // there is no "patched cluster without a passing verification" to warn about — even
+    // though `clone_submit` still refuses this ledger, because the gate compares the
+    // authorized set for EQUALITY with the audited one and a retraction shrinks it. The
+    // coverage question therefore has to be per-patch and subset-shaped, not "would the
+    // gate allow this": a `submittable` flag would print the warning on this run.
+    const { root, ctx } = await passingAttempt([FIRST_FILE, SECOND_FILE])
+    const retracted = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C002', verdict: 'skipped', priority: 'PX',
+      reason: 'reverted: the two bodies only looked alike', replace: true,
+    })
+    expect((retracted as { isError?: boolean }).isError, rendered(retracted)).not.toBe(true)
+
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError, rendered(reported)).not.toBe(true)
+    const summary = JSON.parse(await readFile(join(root, 'runs', 'r1', 'summary.json'), 'utf8')) as {
+      patched: number, verify_ok: boolean, unverified: boolean
+    }
+    expect(summary.patched).toBe(1)
+    expect(summary.verify_ok).toBe(true)
+    expect(summary.unverified).toBe(false)
+    expect(await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')).not.toContain('有已 patch 的簇没有通过的验证')
+  })
+})
+
+describe('a lost revision pointer is not a licence to close over stale verdicts', () => {
+  it('reports gaps, refuses to close, and still allows the documented plain re-assess', async () => {
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({ projectRoot: 'D:/repo', artifactsRoot: join(root, 'runs'), detection: { provider: 'csv', csvPath: csv } }, fakeRunner(GIT_OK))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    const first = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'report_only', priority: 'P1',
+      reason: 'renaming-only difference', evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'virtual void draw();' },
+    })
+    expect((first as { isError?: boolean }).isError, rendered(first)).not.toBe(true)
+
+    // The on-disk state a failed scan leaves: `clusters.jsonl` was replaced by a new scan
+    // and the pointer write that should have followed never landed. The shipped order now
+    // writes the pointer FIRST, so this exact pair can only come from a deletion or from
+    // an older version — which is why the read side has to be conservative as well.
+    const { runPaths, writeAtomic } = await import('../src/core/artifacts.ts')
+    const { scanRevisionPath } = await import('../src/core/clusters.ts')
+    const paths = runPaths(join(root, 'runs'), 'r1')
+    await writeAtomic(paths.clusters, `${JSON.stringify({
+      id: 'C001', size: 1, files: ['module/laws/src/x.cpp', 'module/laws/src/y.cpp'], functions: [],
+      representative: {
+        pair_id: 'p9', similarity: 0.5, detection_method: 'type12',
+        left: { file: 'module/laws/src/x.cpp', function: 'f', lines: '1-2', body: '' },
+        right: { file: 'module/laws/src/y.cpp', function: 'g', lines: '3-4', body: '' },
+      },
+    })}\n`)
+    await rm(scanRevisionPath(paths), { force: true })
+
+    const checked = JSON.parse(rendered(await call(ctx, 'clone_check', { run_id: 'r1', what: 'clusters' }))) as { gaps: string[] }
+    // The verdict was recorded about a.cpp, and C001 now names x.cpp/y.cpp: it cannot be
+    // counted for a cluster set whose revision nobody recorded.
+    expect(checked.gaps).toEqual(['C001'])
+    const refused = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((refused as { isError?: boolean }).isError, rendered(refused)).toBe(true)
+    expect(rendered(refused)).toMatch(/no verdict/)
+
+    // The documented recovery is a PLAIN re-assess: with the pointer gone the tool stamps
+    // no revision, and a stamped record cannot be a duplicate of one it never covered.
+    const second = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'skipped', priority: 'PX', reason: 'new family, out of scope',
+    })
+    expect((second as { isError?: boolean }).isError, rendered(second)).not.toBe(true)
+    const closed = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((closed as { isError?: boolean }).isError, rendered(closed)).not.toBe(true)
   })
 })

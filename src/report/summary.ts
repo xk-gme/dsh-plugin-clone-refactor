@@ -10,9 +10,13 @@ export interface SummaryInput {
   verify: readonly VerifyResult[]
   /**
    * The submit gate's own inputs for the newest attempt: its DIRECTORY number, the
-   * newest verify job record and that attempt's reconcile audit. The verdict below
-   * is computed from these three, so a summary cannot call a run verified while the
-   * gate refuses it.
+   * newest verify job record and that attempt's reconcile audit. The verdict below is
+   * computed from these three, so the summary reports the claim the gate itself reads
+   * rather than a second opinion about it.
+   *
+   * That is the whole claim these three support. The gate can still refuse a ledger the
+   * attempt settled on — a patch authorized after it (`late`) — which is a fact about
+   * the LEDGER, not about the attempt, and `ReportInput.patchesCovered` carries it.
    */
   newestAttempt: number | undefined
   verifyJob: JobRecord | undefined
