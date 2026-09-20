@@ -2423,7 +2423,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { resolveSettings } from '../src/config.ts'
 import { runPaths } from '../src/core/artifacts.ts'
-import { buildDetectionArgv, pythonDetector, redactArgv } from '../src/detect/python.ts'
+import { buildDetectionArgv, pythonDetector, redactArgv, redactText } from '../src/detect/python.ts'
 import { fakeRunner } from './fixtures/fake-runner.ts'
 
 const cleanups: Array<() => Promise<unknown>> = []
@@ -2466,6 +2466,17 @@ describe('redactArgv', () => {
   it('replaces a secret wherever it appears', () => {
     expect(redactArgv(['py', '--key', 'secret-key', '--x', 'secret-key'], ['secret-key']))
       .toEqual(['py', '--key', '[redacted]', '--x', '[redacted]'])
+  })
+
+  it('leaves the arguments alone when there is no secret to redact', () => {
+    expect(redactArgv(['py', '--key', 'k'], ['', ''])).toEqual(['py', '--key', 'k'])
+  })
+})
+
+describe('redactText', () => {
+  it('redacts a secret the child echoed inside a longer string', () => {
+    expect(redactText('using key secret-key now', ['secret-key'])).toBe('using key [redacted] now')
+    expect(redactText('nothing to hide', ['secret-key', ''])).toBe('nothing to hide')
   })
 })
 
@@ -2513,6 +2524,47 @@ describe('pythonDetector', () => {
       .rejects.toThrow(/detection\.scriptPath/)
   })
 })
+
+describe('the embedding channel is selected, not assumed', () => {
+  it('asks for the commercial channel when a commercial endpoint is configured', () => {
+    const settings = resolveSettings({
+      projectRoot: 'D:/gme',
+      detection: { scriptPath: 'x.py', enableType34: true, embeddingApiKey: 'secret-key' },
+    }).settings
+    const argv = buildDetectionArgv({ settings, module: 'base', outputRoot: 'D:/out' })
+    // The script falls back to `local` for a missing or unknown provider, so
+    // without this flag the configured base/key are silently ignored.
+    expect(argv).toContain('--embedding-provider'); expect(argv).toContain('commercial')
+  })
+
+  it('leaves the pipeline default channel alone when nothing commercial is configured', () => {
+    const settings = resolveSettings({ projectRoot: 'D:/gme', detection: { scriptPath: 'x.py', enableType34: true } }).settings
+    const argv = buildDetectionArgv({ settings, module: 'base', outputRoot: 'D:/out' })
+    expect(argv).not.toContain('--embedding-provider')
+  })
+})
+
+describe('a leaked credential', () => {
+  it('is redacted in the run log and in the thrown message, not just on the command line', async () => {
+    const dir = await workspace()
+    const paths = runPaths(dir, 'r1')
+    const settings = resolveSettings({
+      projectRoot: 'D:/gme',
+      detection: { pythonPath: 'py.exe', scriptPath: 'D:/agent/run.py', embeddingApiKey: 'secret-key' },
+    }).settings
+    // The child was started with the key on its argv, so a pipeline that echoes its
+    // own configuration is the realistic leak this test pins.
+    const runner = fakeRunner([['py.exe', { exitCode: 1, stdout: 'boot with secret-key\n', stderr: 'fatal: secret-key rejected\n' }]])
+    const error = await pythonDetector()
+      .detect({ settings, runner, paths, module: 'base', csvPath: '', signal: undefined })
+      .then(() => undefined, (caught: unknown) => caught as Error)
+    expect(error?.message).toContain('[redacted]')
+    expect(error?.message).not.toContain('secret-key')
+    const log = await readFile(join(paths.detectionDir, 'detect-command.txt'), 'utf8')
+    expect(log).toContain('[redacted]')
+    expect(log).not.toContain('secret-key')
+  })
+})
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2555,6 +2607,10 @@ export function buildDetectionArgv(options: BuildArgvOptions): string[] {
   argv.push(detection.enableType34 ? '--enable-type34' : '--disable-type34')
   if (detection.enableType34) {
     if (detection.embeddingModel !== '') argv.push('--type34-model', detection.embeddingModel)
+    // 这个插件只暴露 commercial 通道的两个旋钮（base/key），而脚本的 `--embedding-provider`
+    // 缺省与未知值一律回退为 `local` —— 不显式选择通道，配置好的 base/key 会被**静默忽略**，
+    // type-3-4 打到内网通道上。"配置了却毫无作用"与"容器类型错误却不告警"是同一类缺陷。
+    if (detection.embeddingApiBase !== '' || detection.embeddingApiKey !== '') argv.push('--embedding-provider', 'commercial')
     if (detection.embeddingApiBase !== '') argv.push('--embedding-commercial-api-base', detection.embeddingApiBase)
     if (detection.embeddingApiKey !== '') argv.push('--embedding-commercial-api-key', detection.embeddingApiKey)
     argv.push('--type34-threshold', String(detection.embeddingThreshold))
@@ -2566,6 +2622,21 @@ export function buildDetectionArgv(options: BuildArgvOptions): string[] {
 export function redactArgv(argv: readonly string[], secrets: readonly string[]): string[] {
   const present = secrets.filter(secret => secret !== '')
   return argv.map(arg => (present.some(secret => arg.includes(secret)) ? '[redacted]' : arg))
+}
+
+/**
+ * The same rule for free text. Redacting the command line is not enough: the child
+ * is started with the key on its argv, so its own echo of that argv is the most
+ * likely thing a diagnostic log contains — and the same streams are sliced into
+ * the thrown message. `replaceAll` per secret, because the occurrence is not
+ * necessarily a whole argument.
+ */
+export function redactText(text: string, secrets: readonly string[]): string {
+  let redacted = text
+  for (const secret of secrets) {
+    if (secret !== '') redacted = redacted.replaceAll(secret, '[redacted]')
+  }
+  return redacted
 }
 
 /** The merged CSV the pipeline writes for one module. */
@@ -2589,15 +2660,16 @@ export function pythonDetector(): CloneDetector {
         // 一个模块的克隆检测是长活：60 分钟上限，与 brief 的 `agent_timeout_seconds` 同量级。
         argv, cwd: settings.projectRoot, timeoutMs: 3_600_000, signal,
       })
-      // Keep the invocation next to its output, with the API key redacted: the
-      // run directory is the only durable record of what produced these clusters.
+      // Keep the invocation next to its output, with the API key redacted — and
+      // redact the captured streams too, not just the command line we composed.
+      const secrets = [settings.detection.embeddingApiKey]
       await writeFile(
         join(paths.detectionDir, 'detect-command.txt'),
-        `${redactArgv(argv, [settings.detection.embeddingApiKey]).join(' ')}\nexit=${String(result.exitCode)}\n\n${result.stdout}\n${result.stderr}`,
+        redactText(`${redactArgv(argv, secrets).join(' ')}\nexit=${String(result.exitCode)}\n\n${result.stdout}\n${result.stderr}`, secrets),
         'utf8',
       )
       if (result.exitCode !== 0) {
-        const detail = (result.stderr.trim() || result.stdout.trim() || `exit ${String(result.exitCode)}`).slice(0, 2000)
+        const detail = redactText(result.stderr.trim() || result.stdout.trim() || `exit ${String(result.exitCode)}`, secrets).slice(0, 2000)
         throw new Error(`The clone-detection pipeline failed (${detail})`)
       }
       const csv = mergedCsvPath(paths.detectionDir, target)
