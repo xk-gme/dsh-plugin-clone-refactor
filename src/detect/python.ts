@@ -30,6 +30,12 @@ export function buildDetectionArgv(options: BuildArgvOptions): string[] {
   argv.push(detection.enableType34 ? '--enable-type34' : '--disable-type34')
   if (detection.enableType34) {
     if (detection.embeddingModel !== '') argv.push('--type34-model', detection.embeddingModel)
+    // This plugin only exposes the two commercial knobs (base/key), while the script
+    // falls back to `local` for a missing or unknown `--embedding-provider`: without
+    // selecting the channel explicitly, a configured base/key is silently ignored and
+    // type 3-4 runs on the local channel. "Configured but inert" is a defect of the
+    // same class as a container warning that never fires.
+    if (detection.embeddingApiBase !== '' || detection.embeddingApiKey !== '') argv.push('--embedding-provider', 'commercial')
     if (detection.embeddingApiBase !== '') argv.push('--embedding-commercial-api-base', detection.embeddingApiBase)
     if (detection.embeddingApiKey !== '') argv.push('--embedding-commercial-api-key', detection.embeddingApiKey)
     argv.push('--type34-threshold', String(detection.embeddingThreshold))
@@ -41,6 +47,21 @@ export function buildDetectionArgv(options: BuildArgvOptions): string[] {
 export function redactArgv(argv: readonly string[], secrets: readonly string[]): string[] {
   const present = secrets.filter(secret => secret !== '')
   return argv.map(arg => (present.some(secret => arg.includes(secret)) ? '[redacted]' : arg))
+}
+
+/**
+ * The same rule for free text. Redacting the command line is not enough: the child
+ * is started with the key on its argv, so its own echo of that argv is the most
+ * likely thing a diagnostic log contains — and the same streams are sliced into
+ * the thrown message. `replaceAll` per secret, because the occurrence is not
+ * necessarily a whole argument.
+ */
+export function redactText(text: string, secrets: readonly string[]): string {
+  let redacted = text
+  for (const secret of secrets) {
+    if (secret !== '') redacted = redacted.replaceAll(secret, '[redacted]')
+  }
+  return redacted
 }
 
 /** The merged CSV the pipeline writes for one module. */
@@ -72,15 +93,16 @@ export function pythonDetector(): CloneDetector {
       const result = await runner.run({
         argv, cwd: settings.projectRoot, timeoutMs: DETECTION_TIMEOUT_MS, signal,
       })
-      // Keep the invocation next to its output, with the API key redacted: the
-      // run directory is the only durable record of what produced these clusters.
+      // Keep the invocation next to its output, with the API key redacted — and
+      // redact the captured streams too, not just the command line we composed.
+      const secrets = [settings.detection.embeddingApiKey]
       await writeFile(
         join(paths.detectionDir, 'detect-command.txt'),
-        `${redactArgv(argv, [settings.detection.embeddingApiKey]).join(' ')}\nexit=${String(result.exitCode)}\n\n${result.stdout}\n${result.stderr}`,
+        redactText(`${redactArgv(argv, secrets).join(' ')}\nexit=${String(result.exitCode)}\n\n${result.stdout}\n${result.stderr}`, secrets),
         'utf8',
       )
       if (result.exitCode !== 0) {
-        const detail = (result.stderr.trim() || result.stdout.trim() || `exit ${String(result.exitCode)}`).slice(0, 2000)
+        const detail = redactText(result.stderr.trim() || result.stdout.trim() || `exit ${String(result.exitCode)}`, secrets).slice(0, 2000)
         throw new Error(`The clone-detection pipeline failed (${detail})`)
       }
       const csv = mergedCsvPath(paths.detectionDir, target)
