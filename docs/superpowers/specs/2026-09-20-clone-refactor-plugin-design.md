@@ -296,8 +296,9 @@ verify:
 | `submit.mode` | `none` | none/commit/push/pr |
 | `submit.baseBranch` | — | PR 目标分支 |
 | `workdir.allowDirty` | `false` | 允许在工作区不干净时开跑（此时按文件哈希记录基线，对账只认账本里的文件） |
-| `workdir.returnToOriginalBranch` | `false` | 跑完是否切回原分支（`clone-refactor/<run_id>` 分支始终保留） |
 | `pageChars` | `12000` | 每次返回报告的分页字符数 |
+
+> **as-built 补记（发布前回填，2026-09-20）：`workdir.returnToOriginalBranch` 已作为**死配置**删除。** 本表原有一行 `workdir.returnToOriginalBranch`（"跑完是否切回原分支"，默认 `false`）：`resolveSettings` 会解析并归一化它，但**本版本没有任何代码路径读它**，所以它只是一个"配了也不动"的旋钮 —— 正是 R32 判过的那一类。两条出路（实现它 / 删掉它）里选了**删掉**：0.1.0 尚未发布，没有任何使用者依赖它，删掉不改变任何行为；而实现它意味着在 `clone_submit` 之后增加一次分支切换，那会让"提交之后再跑一次 `clone_verify`"落在一个已经切走的工作树上（补丁不在树里，对账会把所有授权文件算成 `missing`），多出一个本版不需要的混乱状态。删掉之后，配置面里只剩代码真正读的键。**不是遗漏，是取舍**：想加回来的话，实现点和它引入的语义要一并想清楚。
 
 环境变量回退：`GME_CLONE_REFACTOR_ROOT`、`GME_CLONE_REFACTOR_ARTIFACTS` 等，与现有两个插件的风格一致。
 

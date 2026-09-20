@@ -88,6 +88,21 @@ function documentedIn(text: string, key: string): boolean {
   return new RegExp(`${pattern}(?![A-Za-z0-9_.])`).test(text)
 }
 
+/**
+ * The configuration-reference section of a setup doc: `## 4.` up to the next
+ * heading. The reverse check below is scoped to it deliberately — prose elsewhere
+ * legitimately contains dotted names that are file paths (`docs/setup.md`), package
+ * files (`cordis.patch.yml`) or hosts (`registry.npmjs.org`), and none of those is
+ * a settings key. Both setup docs number this section `## 4.`.
+ */
+function configurationSection(text: string): string {
+  const start = text.search(/^## 4\./m)
+  if (start === -1) return ''
+  const rest = text.slice(start + 1)
+  const end = rest.search(/^## /m)
+  return end === -1 ? rest : rest.slice(0, end)
+}
+
 describe('the tool table in the two READMEs', () => {
   it('names exactly the clone_* tools the plugin registers, in English and in Chinese', async () => {
     const registered = await registeredToolNames()
@@ -126,6 +141,23 @@ describe('the configuration reference in the two setup docs', () => {
       const text = await readFile(join(ROOT, file), 'utf8')
       const missing = documented.filter(path => !documentedIn(text, path))
       expect(missing, `${file} does not document: ${missing.join(', ')}`).toEqual([])
+    }
+    // The reverse direction, which is the one that hides dead configuration: a table
+    // presenting a key as real that `resolveSettings` does not produce at all. This is
+    // the check that would have caught `workdir.returnToOriginalBranch` on its own —
+    // parsed, normalized, documented in the spec and both setup docs, and read by no
+    // code path in the release. Every row whose first cell is a single backticked key
+    // is compared against what the resolver actually produces.
+    const known = new Set<string>([...required, ...stepFields])
+    for (const file of ['docs/setup.md', 'docs/setup.zh.md']) {
+      const section = configurationSection(await readFile(join(ROOT, file), 'utf8'))
+      // A section this check cannot locate would make the assertion below vacuous.
+      expect(section.length, `${file} has no configuration-reference section to check`).toBeGreaterThan(0)
+      const claimed = [...new Set(section.split('\n')
+        .map(line => /^\|\s*`([A-Za-z][A-Za-z0-9_.[\]]*)`\s*\|/.exec(line)?.[1])
+        .filter((key): key is string => key !== undefined))]
+        .filter(key => !known.has(key))
+      expect(claimed, `${file} documents keys resolveSettings() does not produce: ${claimed.join(', ')}`).toEqual([])
     }
   })
 })

@@ -135,7 +135,6 @@ Every key is optional; an invalid value degrades to its default with a warning (
 | `submit.remote` | `"origin"` | The remote `git push` uses. Ignored unless the mode is `push` or `pr` |
 | `submit.commitMessageTemplate` | `""` | Commit message template. Empty means `clone refactor(<run_id>): deduplicate <n> file(s)`. The placeholders are `{run_id}`, `{files_count}` and `{timestamp}`; an unknown placeholder is left visible rather than blanked |
 | `workdir.allowDirty` | `false` | Start a run on a work tree that already has changes. It records a hashed baseline and reconciles against the ledger only — and it **disables automatic rollback** (section 8) |
-| `workdir.returnToOriginalBranch` | `false` | Accepted and normalized, but **no code path consults it in this release**: setting it changes nothing. The run's branch, when `authorization.enabled` created one, is left in place after the run |
 | `reportLanguage` | `"zh"` | Language of `report.md` and of the tool result digest: `zh` or `en` |
 | `pageChars` | `12000` | The character budget of one `clone_check` clusters page (256–50000). A cluster carries two function bodies, so the page is bounded by characters, not by a fixed count |
 

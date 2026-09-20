@@ -135,7 +135,6 @@ node $dsh web
 | `submit.remote` | `"origin"` | `git push` 用的远端。只在 `push` / `pr` 模式下有意义 |
 | `submit.commitMessageTemplate` | `""` | 提交信息模板。为空即 `clone refactor(<run_id>): deduplicate <n> file(s)`。可用占位符为 `{run_id}`、`{files_count}`、`{timestamp}`；未知占位符保持原样可见，不会被清空 |
 | `workdir.allowDirty` | `false` | 允许在工作区已有改动时开跑。它记录按哈希的基线，对账只认账本里的文件——并且**停用自动回滚**（第 8 节） |
-| `workdir.returnToOriginalBranch` | `false` | 会被接受并归一化，但**本版本的任何代码路径都没有读它**：设置它不改变任何行为。开了 `authorization.enabled` 时创建的那个分支，run 结束后仍然留在原处 |
 | `reportLanguage` | `"zh"` | `report.md` 与工具结果摘要的语言：`zh` 或 `en` |
 | `pageChars` | `12000` | 一次 `clone_check` 簇分页的字符预算（256–50000）。一个簇带两份函数体，所以分页按字符界而不是固定条数 |
 

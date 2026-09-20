@@ -5243,6 +5243,8 @@ npm pack --dry-run           # 确认清单后再考虑 npm publish
   - README 少了两节同族插件都有的内容（`## Development`、`## License`）。→ 补进模板，并把"照着 `dsh-gme-defect-scan` 的分节顺序与深度写"写成硬要求：同族四个文档同名同形，读者才不用在两套结构之间切换。
   - **R51 让包里四句话变成了假话**（这是本任务新增的、由别的 ruling 产生的收尾项）：`src/index.ts:68` 的 "A job stuck at running was interrupted, not successful"、`src/report/report.ts:225` 的 "停在 running 说明任务被中断，不是成功"、`src/core/jobs.ts:4` 的同义 docblock，以及 **`src/core/ledger.ts:9`** —— 最后这条是 R51 的复审者额外找出来的：它还在警告"`writeAtomic` 的固定 `<file>.tmp` 名"，而 R51 正是把固定名改成了每次调用唯一的名字，所以这句话**方向反了**（原来担心的事已经不可能发生，真正该说的是"没有共享 temp 名了"）。R51 之后，终态写盘失败时任务**可能已经成功**，记录却仍停在 `running`（R51 自己的新测试就分别覆盖了"任务失败"与"任务成功"两种留 `running` 的情形）。→ 四处都要改成同时说出两种成因、并指明失败在哪里被报告（目前只有 `ctx.logger.warn`，**模型看不到** —— 所以文档还要告诉操作者去 Harness 日志里看，不能只依赖 `clone_check` 的 `status`）；**先读 R51 提交后的代码再写**，因为这些句子必须与实现的真实行为一致，而不是与我的推测一致。
 
+- **发布前删除了一条死配置：`workdir.returnToOriginalBranch`（controller 编辑，非某个任务）。** Task 15 的实现者在写文档时发现它：`resolveSettings` 解析并归一化它、`config.spec.ts` 断言它、spec §12 把它写成"跑完是否切回原分支"，但**没有任何代码路径读它** —— 正是 R32 判过的那一类（"配了也不动"）。两条出路选**删掉**：0.1.0 未发布、无使用者依赖，删掉不改变任何行为；而实现它要在 `clone_submit` 之后增加一次分支切换，会让"提交后再跑 `clone_verify`"落在一个已切走的工作树上，多出一个本版不需要的混乱状态。**这是取舍不是遗漏**，理由写在 spec §12 的 as-built 补记里。附带做了一件比删键更有价值的事：`tests/docs.spec.ts` 增加了**反向**检查 —— §4 配置表里每个"首个单元格是反引号键"的行都必须是 `resolveSettings({})` 真正产出的键（用一次变异验证：塞进 `workdir.returnToOriginalBranchX` 会红并点出该键），所以"文档写了一个不存在的键"从此会自己变红，而不是等下一个读到它的人发现。
+
 **4. 与 spec 的已记录偏离**
 
 - 分簇只做结构分簇（spec §7 与 §15 已更新，Task 7 的范围声明与此一致）。

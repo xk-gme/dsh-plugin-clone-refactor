@@ -55,7 +55,7 @@ export interface Settings {
   authorization: { enabled: boolean; maxPriority: Priority; maxClusters: number }
   verify: { steps: VerifyStep[]; keepFailedPatch: boolean; outputMaxBytes: number; graceMs: number }
   submit: { mode: SubmitMode; baseBranch: string; remote: string; commitMessageTemplate: string }
-  workdir: { allowDirty: boolean; returnToOriginalBranch: boolean }
+  workdir: { allowDirty: boolean }
   reportLanguage: 'zh' | 'en'
   pageChars: number
 }
@@ -229,7 +229,6 @@ export function resolveSettings(raw: unknown): { settings: Settings; warnings: s
       },
       workdir: {
         allowDirty: boolean(workdir.allowDirty, false, 'workdir.allowDirty', warnings),
-        returnToOriginalBranch: boolean(workdir.returnToOriginalBranch, false, 'workdir.returnToOriginalBranch', warnings),
       },
       reportLanguage,
       pageChars: integer(source.pageChars, 12_000, 'pageChars', 256, 50_000, warnings),

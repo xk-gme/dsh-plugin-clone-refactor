@@ -13,7 +13,7 @@ describe('resolveSettings', () => {
     expect(settings.verify.steps).toEqual([])
     expect(settings.verify.keepFailedPatch).toBe(false)
     expect(settings.submit.mode).toBe('none')
-    expect(settings.workdir).toEqual({ allowDirty: false, returnToOriginalBranch: false })
+    expect(settings.workdir).toEqual({ allowDirty: false })
     expect(settings.pageChars).toBe(12000)
   })
 
