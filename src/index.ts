@@ -1,16 +1,16 @@
-/**
- * Plugin entry: the composition root. Task 1 owns only the mount contract —
- * `name`, `inject`, the loose `Config` row and a defensive `apply` — so the
- * build, the install and the config tests have an entry to compile. The tools
- * and every capability module are registered here by a later task.
- */
+/** GME clone refactor inside Harness: detection, judging, verification, submission. */
 import type { Context } from '@deepseek-ai/cordis'
+// Side-effect type import: loads the `declare module '@deepseek-ai/cordis'`
+// augmentation that puts `systemPrompt` on `Context`.
+import type {} from '@deepseek-ai/dsh-system-prompt'
 import z from '@deepseek-ai/schemastery'
-import { resolveSettings } from './config.ts'
+import { resolveSettings, type Settings } from './config.ts'
+import { hostRunner } from './core/command-host.ts'
+import { artifactsRootOf } from './core/run.ts'
+import { registerTools } from './tools.ts'
 
 export type { DetectionProvider, Priority, Settings, SubmitMode, VerifyPhase, VerifyStep } from './config.ts'
 
-/** What the profile row may carry. Read defensively by `resolveSettings`. */
 export interface Config {
   projectRoot?: unknown
   artifactsRoot?: unknown
@@ -24,18 +24,12 @@ export interface Config {
 }
 
 export const name = 'gme-clone-refactor'
+export const inject = ['tools', 'systemPrompt']
+
 /**
- * Nothing yet: this task's `apply` reads only its own config. The tools and
- * prompt sections that need `tools` and `systemPrompt` arrive with the later
- * capability modules, which declare their injections here.
- */
-export const inject: string[] = []
-/**
- * Every field is deliberately loose. A row whose config fails validation takes
- * the whole plugin tree down at boot, so wrong values are degraded by
- * `resolveSettings` (with a warning) instead of being rejected by the loader.
- * The defaults here only have to keep `Config({})` valid; `resolveSettings` owns
- * the real defaults and the warnings.
+ * Every field is intentionally loose: a row whose config fails validation takes
+ * the whole plugin tree down at boot, so `resolveSettings` degrades bad values
+ * with a warning instead. These defaults only keep `Config({})` valid.
  */
 export const Config: z<Config> = z.object({
   projectRoot: z.any().default(''),
@@ -49,27 +43,69 @@ export const Config: z<Config> = z.object({
   pageChars: z.any().default(12_000),
 })
 
-/** The one-line reason from a caught value, for a warning message. */
-function reason(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+export { resolveSettings } from './config.ts'
+
+/** What the model is told while this plugin is mounted. */
+export function guidanceText(settings: Settings, configured: boolean): string {
+  if (!configured) {
+    return [
+      'GME clone refactor is installed but NOT available: no projectRoot is configured, so no clone_refactor tool was registered.',
+      'To enable it the user must point the plugin at a GME work tree and restart Harness:',
+      '1. Export GME_CLONE_REFACTOR_ROOT=<absolute path to the GME checkout> (optional: GME_CLONE_REFACTOR_ARTIFACTS=<run directory>) before Harness starts, or override the gme-clone-refactor row in $DSH_HOME/profiles/<profile>/cordis.patch.yml:',
+      '   - id: gme-clone-refactor',
+      '     config:',
+      '       projectRoot: <absolute path to the GME checkout>',
+      '       artifactsRoot: <run directory>   # optional',
+      '2. Decide the detection source: detection.provider: csv with detection.csvPath pointing at an existing func_clone_<module>.csv (no Python needed), or detection.provider: python-pipeline with detection.scriptPath pointing at docs/.codex/skills/cpp-clone-detection/scripts/run_gme_clone_detection.py (needs Python, libclang and, for type 3-4, an embeddings endpoint).',
+      '3. Patching source is off by default. To allow one authorized P0 patch per run, set authorization.enabled: true (authorization.maxPriority, authorization.maxClusters).',
+      '4. clone_verify needs verify.steps: the build, test, format and restore commands for this site. Without them nothing can be verified and nothing may be submitted.',
+      '5. Submissions are off by default (submit.mode: none); commit, push or pr must be chosen deliberately.',
+      'Report these steps when the user asks for a clone refactor or asks why its tools are missing.',
+    ].join('\n')
+  }
+  const lines = [
+    'GME clone refactor: clone_scan produces the clone families of one module and is the coverage contract — every cluster must end with a verdict before clone_report closes the run.',
+    'clone_check is read-only and is how progress is polled: clone_scan and clone_verify are background jobs, so a call returns accepted and the job record is the truth. A job stuck at running was interrupted, not successful.',
+    'Judge each cluster from the real source, not from the CSV excerpt. The clustering is structural only: it has no skeleton or risk-signal analysis, so the priority is yours to decide.',
+    'A patched verdict needs confirm: true, authorization.enabled, the files it changed and evidence. A P0 cluster you leave unpatched needs evidence of the concrete blocker — "semantics unclear" is not evidence and is rejected.',
+    'clone_verify reconciles the authorization ledger against the actual git diff first: a changed file the user never authorized freezes the run with UNAUTHORIZED_CHANGES. Never edit around that.',
+    'Nothing may be submitted before a passing clone_verify, and clone_submit needs confirm: true. Report the outcome to the user; do not submit on your own initiative.',
+  ]
+  if (!settings.authorization.enabled) lines.push('Patching is DISABLED in this deployment: you may still scan, judge and report, but clone_assess rejects a patched verdict. Say so instead of editing files.')
+  if (settings.verify.steps.length === 0) lines.push('verify.steps is empty, so no verification can run — patches cannot be validated and must not be submitted.')
+  if (settings.authorization.enabled && settings.verify.steps.length === 0) lines.push('Patching is enabled but nothing can verify it: treat every patch as unverified and tell the user.')
+  return lines.join('\n')
 }
 
-/**
- * Mount the plugin row: normalize the configuration and report every degraded
- * value as a warning. Never throws — this runs at boot, and a throw here is a
- * plugin-tree failure.
- */
+/** Register the clone-refactor tools and stance; must never throw. */
 export function apply(ctx: Context, config: Config): void {
   try {
     const { settings, warnings } = resolveSettings(config)
     for (const warning of warnings) ctx.logger.warn(`gme-clone-refactor: ${warning}`)
-    if (settings.projectRoot === '') {
-      ctx.logger.warn('gme-clone-refactor: no projectRoot is configured, so no clone-refactor tool is registered')
+    const configured = settings.projectRoot !== ''
+    ctx.systemPrompt.section({ name, order: 148, text: guidanceText(settings, configured) })
+    if (!configured) {
+      ctx.logger.warn(
+        'gme-clone-refactor: projectRoot is not configured, so no clone-refactor tools were registered. '
+        + 'Set GME_CLONE_REFACTOR_ROOT before starting Harness, or override the gme-clone-refactor row in the profile patch. '
+        + 'The model has been told these steps and will report them.',
+      )
+      return
+    }
+    // The only place the host-backed runner is constructed: every other module
+    // receives it as a parameter, which is what keeps the capability modules
+    // testable without a compiler or a subprocess provider.
+    const runner = hostRunner(ctx, { maxBytes: settings.verify.outputMaxBytes, graceMs: settings.verify.graceMs })
+    try {
+      registerTools(ctx, settings, runner, artifactsRootOf(settings))
+    } catch (error) {
+      ctx.logger.warn(`gme-clone-refactor: the clone-refactor tools were not registered (${reason(error)})`)
     }
   } catch (error) {
-    // The guard is around the whole mount, not around an enumeration of bad
-    // inputs: a `!!js` config expression can reach `resolveSettings` with a
-    // value nothing there can foresee.
     ctx.logger.warn(`gme-clone-refactor: mounting stopped early (${reason(error)})`)
   }
+}
+
+function reason(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }

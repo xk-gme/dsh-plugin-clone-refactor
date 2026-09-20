@@ -1,0 +1,342 @@
+/** The six tools: argument validation, authorization gates and presentation. */
+import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
+import { join } from 'node:path'
+import { PRIORITIES, PRIORITY_RANK, type Settings } from './config.ts'
+import { assertInsideRoot, runPaths, writeAtomic } from './core/artifacts.ts'
+import { loadJsonlClusters, saveJsonlClusters } from './core/clusters.ts'
+import { coverageGaps, loadAssessments, loadPatches, recordAssessment, savePatches } from './core/ledger.ts'
+import { detach, latestJob, startJob } from './core/jobs.ts'
+import { normalizePath } from './core/paths.ts'
+import { loadRun, openRun, saveRun } from './core/run.ts'
+import { requireText, VERDICTS, type Assessment, type PatchRecord } from './core/schema.ts'
+import { csvDetector } from './detect/csv.ts'
+import { pythonDetector } from './detect/python.ts'
+import { checkoutFiles, parseNameOnly, parsePorcelain } from './git/baseline.ts'
+import { reconcile } from './git/reconcile.ts'
+import { writeReport } from './report/report.ts'
+import { renderCommitMessage, submit } from './submit.ts'
+import { loadUnauthorized, loadVerifyAttempts, readNewestVerifyLog } from './verify/artifacts.ts'
+import { runVerification } from './verify/engine.ts'
+
+const EVIDENCE = { type: 'object', additionalProperties: false, properties: {
+  file: { type: 'string', required: true, description: 'A file the cluster actually touches.' },
+  line: { type: 'integer', required: true, description: 'The line of the concrete blocker or of the applied change.' },
+  snippet: { type: 'string', required: true },
+} } as const
+
+function output<S extends object>(schema: S) {
+  return { schema, render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }] }
+}
+
+/**
+ * The plain-JSON projection of a value that is already JSON-serializable.
+ *
+ * A `clone_check` result and a report summary are contractually lossless JSON —
+ * no `Date`, no `undefined`, no toJSON — but their interfaces declare no index
+ * signature, so an open output schema (which infers
+ * `{declared keys} & Record<string, JsonValue>`) rejects them. Intersecting the
+ * value's own type back in keeps each declared key required while the JSON
+ * projection supplies the index signature. The round trip is the erasure, done
+ * once here rather than at four call sites; a test pins that it preserves every
+ * field at runtime.
+ */
+function asJson<T>(value: T): T & Record<string, JsonValue> {
+  return JSON.parse(JSON.stringify(value)) as T & Record<string, JsonValue>
+}
+
+/** Reject an unknown cluster with the ids this run does have. */
+function knownCluster(ids: readonly string[], requested: string): string {
+  if (!ids.includes(requested)) {
+    throw new Error(`Unknown cluster_id '${requested}'. ${ids.length === 0 ? 'This run has no clusters yet — call clone_scan first.' : `Known ids: ${ids.slice(0, 20).join(', ')}`}`)
+  }
+  return requested
+}
+
+export function registerTools(ctx: Context, settings: Settings, runner: import('./core/command.ts').CommandRunner, artifactsRoot: string): void {
+  ctx.tools.register(defineTool({
+    name: 'clone_scan',
+    description: 'Scan one module for clone families and record them as this run\'s coverage contract. Runs in the background: the result is accepted, so poll clone_check until the job settles. Every cluster this produces must end with a verdict before clone_report will close the run.',
+    parameters: {
+      run_id: { type: 'string', description: 'Continue an existing run, or create one under this id when none exists; the result reports created.' },
+      module: { type: 'string', description: 'python-pipeline provider only: the GME module name, for example base or laws.' },
+      csv_path: { type: 'string', description: 'csv provider only: the func_clone CSV to read, overriding detection.csvPath.' },
+      refresh: { type: 'boolean', description: 'Scan again even when this run already has clusters.' },
+    },
+    output: output({ type: 'object', additionalProperties: false, properties: {
+      run_id: { type: 'string', required: true }, job_id: { type: 'string', required: true },
+      accepted: { type: 'boolean', required: true }, created: { type: 'boolean', required: true },
+      clusters: { type: 'integer', required: true }, provider: { type: 'string', required: true },
+      guidance: { type: 'string', required: true },
+    } }),
+    async execute(args) {
+      const requested = args.run_id?.trim() === '' || args.run_id === undefined ? undefined : args.run_id
+      const opened = await openRun({ settings, runner, artifactsRoot, ...(requested === undefined ? {} : { runId: requested }) })
+      const existing = await loadJsonlClusters(opened.paths)
+      if (existing.length > 0 && args.refresh !== true) {
+        return { run_id: opened.record.run_id, job_id: '', accepted: false, created: opened.created, clusters: existing.length, provider: opened.record.detection_provider, guidance: 'Clusters already exist for this run. Pass refresh: true to scan again.' }
+      }
+      const detector = settings.detection.provider === 'python-pipeline' ? pythonDetector() : csvDetector()
+      const runId = opened.record.run_id
+      const paths = opened.paths
+      // Detached on purpose: detection is minutes long, and the tool call must
+      // return so the model can poll. The job record is the durable progress.
+      const job = await startJob(paths, runId, 'scan')
+      detach(paths, job, async () => {
+        const detected = await detector.detect({ settings, runner, paths, module: args.module ?? '', csvPath: args.csv_path ?? '', signal: undefined })
+        await saveJsonlClusters(paths, detected.clusters)
+        await saveRun(paths, { ...opened.record, detection_provider: detected.provider === 'python-pipeline' ? 'python-pipeline' : 'csv' })
+        return detected
+      }, detected => `${detected.clusters.length} cluster(s) via ${detected.provider}`)
+      return {
+        run_id: runId, job_id: job.job_id, accepted: true, created: opened.created,
+        clusters: existing.length, provider: detector.id,
+        guidance: `Scanning "${args.module ?? ''}" with ${detector.id}. Poll clone_check with what: status until the job leaves running.`,
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: 'Clone refactor', kind: 'other', rawInput: `scan ${args.module ?? ''}` }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'clone_check',
+    description: 'Read-only progress and ledger inspection: the newest background job, the clusters, the verdict ledger, or the tail of the newest verification log. Never changes anything.',
+    parameters: {
+      run_id: { type: 'string', required: true },
+      what: { type: 'string', required: true, enum: ['status', 'clusters', 'ledger', 'log'] },
+      offset: { type: 'integer', description: 'clusters only: the index this page starts at.' },
+      log_lines: { type: 'integer', description: 'log only: trailing lines to return (default 80).' },
+    },
+    output: output({ type: 'object', additionalProperties: true, properties: { run_id: { type: 'string', required: true }, what: { type: 'string', required: true } } }),
+    async execute(args) {
+      const runId = requireText(args.run_id, 'run_id')
+      // A read-only tool must not create a run: `openRun` reads the baseline and
+      // may switch branches, so it is a write. Inspect an existing run or fail.
+      assertInsideRoot(artifactsRoot, runId)
+      const paths = runPaths(artifactsRoot, runId)
+      if (await loadRun(paths) === undefined) {
+        throw new Error(`No run '${runId}' under ${artifactsRoot}. Call clone_scan first.`)
+      }
+      if (args.what === 'status') {
+        // `null`, never `undefined`: an absent key would vanish from the JSON the
+        // model reads, and a poller could not tell "no job yet" from a lost field.
+        return asJson({ run_id: runId, what: 'status', job: (await latestJob(paths)) ?? null })
+      }
+      if (args.what === 'ledger') {
+        const { latest, droppedLines } = await loadAssessments(paths)
+        return asJson({ run_id: runId, what: 'ledger', assessments: [...latest.values()], patches: await loadPatches(paths), dropped_lines: droppedLines })
+      }
+      if (args.what === 'log') {
+        const tail = await readNewestVerifyLog(paths, Math.max(1, args.log_lines ?? 80))
+        return asJson({ run_id: runId, what: 'log', log: tail ?? null })
+      }
+      // Bound the page by the configured character budget, not a fixed count: a
+      // cluster carries a representative pair with two bodies, so a hundred of
+      // them can dwarf any response the model can use.
+      const clusters = await loadJsonlClusters(paths)
+      const offset = Math.max(0, args.offset ?? 0)
+      const page: typeof clusters = []
+      let characters = 0
+      for (const cluster of clusters.slice(offset)) {
+        const size = JSON.stringify(cluster).length
+        if (page.length > 0 && characters + size > settings.pageChars) break
+        page.push(cluster)
+        characters += size
+      }
+      const { latest } = await loadAssessments(paths)
+      return asJson({
+        run_id: runId, what: 'clusters', total: clusters.length, offset,
+        next_offset: offset + page.length < clusters.length ? offset + page.length : null,
+        gaps: coverageGaps(clusters.map(cluster => cluster.id), latest),
+        clusters: page,
+      })
+    },
+    presentCall: args => ({ card: 'generic', title: 'Clone refactor', kind: 'other', rawInput: `check ${args.what ?? ''}` }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'clone_assess',
+    description: 'Record one verdict for one cluster: patched, report_only or skipped. A patched verdict needs confirm: true, it needs authorization.enabled, and it needs the files it changed. A P0 report_only verdict needs evidence of the concrete blocker — a generic "unsure" is not a verdict.',
+    parameters: {
+      run_id: { type: 'string', required: true },
+      cluster_id: { type: 'string', required: true },
+      verdict: { type: 'string', required: true, enum: [...VERDICTS] },
+      priority: { type: 'string', required: true, enum: [...PRIORITIES] },
+      reason: { type: 'string', required: true, description: 'Why this verdict: the concrete blocker, or what the patch preserved.' },
+      evidence: EVIDENCE,
+      files_changed: { type: 'array', items: { type: 'string' }, description: 'Repo-relative files this patch touched; required for patched.' },
+      replace: { type: 'boolean', description: 'Overwrite an earlier verdict for this cluster.' },
+      confirm: { type: 'boolean', description: 'Required for a patched verdict: the user explicitly agreed to this source change.' },
+    },
+    output: output({ type: 'object', additionalProperties: false, properties: {
+      run_id: { type: 'string', required: true }, cluster_id: { type: 'string', required: true },
+      verdict: { type: 'string', required: true }, replaced: { type: 'boolean', required: true },
+      covered: { type: 'integer', required: true }, total: { type: 'integer', required: true },
+      remaining: { type: 'integer', required: true }, guidance: { type: 'string', required: true },
+    } }),
+    async execute(args) {
+      const runId = requireText(args.run_id, 'run_id')
+      const clusterId = requireText(args.cluster_id, 'cluster_id')
+      const { paths, record } = await openRun({ settings, runner, artifactsRoot, runId })
+      const clusters = await loadJsonlClusters(paths)
+      knownCluster(clusters.map(cluster => cluster.id), clusterId)
+      const reason = requireText(args.reason, 'reason')
+      const files = (args.files_changed ?? []).map(normalizePath).filter(Boolean)
+      if (args.verdict === 'patched') {
+        if (args.confirm !== true) throw new Error('Recording a patched verdict needs confirm: true — source changes are the user\'s decision, not the model\'s.')
+        // 授权读的是 run 自己的配置快照，不是实时 settings（R28）。"这个 run 能不能改源码、
+        // 最高到哪个优先级、最多几个簇"是用户在**建 run 时**做出的同意决定；允许它在 run
+        // 存活期间被一次 profile 编辑翻转，正是快照存在的意义。而 verify.steps 与
+        // reportLanguage 属于操作者工具链，继续读实时 settings —— 修好一个坏掉的构建命令
+        // 不该逼人放弃整个 run。
+        const authorization = record.settings.authorization
+        if (!authorization.enabled) throw new Error('Patching is disabled: set authorization.enabled: true in the profile row before any run may change source.')
+        if (PRIORITY_RANK[args.priority] < PRIORITY_RANK[authorization.maxPriority]) {
+          throw new Error(`authorization.maxPriority is ${authorization.maxPriority}, so a ${args.priority} cluster may not be patched in this deployment.`)
+        }
+        if (files.length === 0) throw new Error('A patched verdict needs files_changed: the authorization ledger is what clone_verify reconciles against.')
+        if (args.evidence === undefined) throw new Error('A patched verdict needs evidence: the file, line and snippet of the change.')
+        const patches = await loadPatches(paths)
+        if (!patches.some(patch => patch.cluster_id === clusterId) && patches.length >= authorization.maxClusters) {
+          throw new Error(`authorization.maxClusters is ${authorization.maxClusters}; this run already patched ${patches.length} cluster(s).`)
+        }
+      } else if (args.priority === 'P0' && args.evidence === undefined) {
+        throw new Error('A P0 verdict that is not patched needs evidence of the concrete blocker (file, line, snippet). "Semantics unclear" is not evidence.')
+      }
+      const assessment: Assessment = {
+        cluster_id: clusterId, verdict: args.verdict, priority: args.priority, reason,
+        files_changed: files, recorded_at: new Date().toISOString(),
+      }
+      const { replaced } = await recordAssessment(paths, assessment, { replace: args.replace === true })
+      if (args.verdict === 'patched') {
+        const patches = await loadPatches(paths)
+        if (!patches.some(patch => patch.cluster_id === clusterId)) {
+          const added: PatchRecord = { cluster_id: clusterId, priority: args.priority, files_changed: files, recorded_at: assessment.recorded_at }
+          await savePatches(paths, [...patches, added])
+        }
+      }
+      const { latest } = await loadAssessments(paths)
+      const covered = clusters.filter(cluster => latest.has(cluster.id)).length
+      const remaining = clusters.length - covered
+      return {
+        run_id: runId, cluster_id: clusterId, verdict: args.verdict, replaced, covered, total: clusters.length, remaining,
+        guidance: remaining === 0 ? 'Every cluster has a verdict: call clone_verify when a patch is authorized, then clone_report.' : `${remaining} cluster(s) still need a verdict.`,
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: 'Clone refactor', kind: 'other', rawInput: `assess ${args.verdict ?? ''} ${args.cluster_id ?? ''}` }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'clone_verify',
+    description: 'Reconcile the authorization ledger against the actual diff, then run the configured build/test steps. Refuses outright when a changed file was never authorized. Runs in the background: poll clone_check. A patch that has not passed this cannot be submitted.',
+    parameters: { run_id: { type: 'string', required: true } },
+    output: output({ type: 'object', additionalProperties: true, properties: {
+      run_id: { type: 'string', required: true }, job_id: { type: 'string', required: true },
+      accepted: { type: 'boolean', required: true }, attempt: { type: 'integer', required: true },
+      authorized_files: { type: 'array', required: true, items: { type: 'string' } },
+    } }),
+    async execute(args) {
+      const runId = requireText(args.run_id, 'run_id')
+      const { paths, record } = await openRun({ settings, runner, artifactsRoot, runId })
+      // An empty step list must never become a vacuous "verified": the engine reports
+      // ok for zero steps (nothing required failed), and clone_submit reads that as a
+      // passing verification. Refuse loudly here, before anything destructive can
+      // follow — the rollback branch below would otherwise delete the patch over a
+      // configuration problem rather than a failing test.
+      if (settings.verify.steps.length === 0) {
+        throw new Error('verify.steps is empty, so nothing can be verified: configure this site\'s build/test steps before running clone_verify. An unverified patch must not be submitted.')
+      }
+      const patches = await loadPatches(paths)
+      const authorized = [...new Set(patches.flatMap(patch => patch.files_changed.map(normalizePath)))].sort()
+      const status = await runner.run({ argv: ['git', 'status', '--porcelain'], cwd: record.project_root, timeoutMs: 60_000, signal: undefined })
+      const diff = await runner.run({ argv: ['git', 'diff', '--name-only', record.baseline.head], cwd: record.project_root, timeoutMs: 60_000, signal: undefined })
+      const changed = [...new Set([...parsePorcelain(status.stdout), ...parseNameOnly(diff.stdout)])]
+      const audit = reconcile(authorized, changed)
+      const attempt = (await loadVerifyAttempts(paths)).length + 1
+      await writeAtomic(join(paths.verifyDir, String(attempt), 'reconcile.json'), `${JSON.stringify({ authorized, changed, ...audit }, null, 2)}\n`)
+      if (audit.unauthorized.length > 0) {
+        throw new Error(`UNAUTHORIZED_CHANGES: ${audit.unauthorized.join(', ')} changed but is not in the authorization ledger. This run is frozen: resolve or revert those files before verifying or submitting.`)
+      }
+      const job = await startJob(paths, runId, 'verify')
+      detach(paths, job, async () => {
+        const result = await runVerification({ runner, paths, steps: settings.verify.steps, cwd: record.project_root, attempt, signal: undefined })
+        // 自动回滚只在干净基线上才安全。`workdir.allowDirty` 意味着操作者手上本来就有
+        // 未提交的工作：对被跟踪文件执行 `git restore --source=HEAD` 会抹掉他开跑前的
+        // 改动，对未跟踪文件执行 `git clean` 会删掉他开跑前就存在的文件。此时只记录
+        // 失败、把工作区原样留给他处理（`rolled_back: false` 会出现在报告里）。
+        if (!result.ok && !record.settings.verify.keepFailedPatch && authorized.length > 0 && record.baseline.dirty.length === 0) {
+          await checkoutFiles(runner, record.project_root, authorized)
+          result.rolled_back = true
+          result.rollback_files = authorized
+        }
+        await writeAtomic(join(paths.verifyDir, String(attempt), 'result.json'), `${JSON.stringify(result, null, 2)}\n`)
+        return result
+      }, result => `attempt ${result.attempt}: ${result.ok ? 'PASS' : 'FAIL'}`)
+      return { run_id: runId, job_id: job.job_id, accepted: true, attempt, authorized_files: authorized }
+    },
+    presentCall: args => ({ card: 'generic', title: 'Clone refactor', kind: 'other', rawInput: `verify ${args.run_id ?? ''}` }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'clone_submit',
+    description: 'Commit, push and optionally open a pull request for the authorized files — only after a passing clone_verify. Requires confirm: true; without it the call fails and nothing outward happens.',
+    parameters: {
+      run_id: { type: 'string', required: true },
+      confirm: { type: 'boolean', required: true, description: 'Set true only after the user explicitly agreed to this submission.' },
+      mode: { type: 'string', enum: ['none', 'commit', 'push', 'pr'], description: 'Overrides submit.mode for this call.' },
+      pr_title: { type: 'string' }, pr_body: { type: 'string' },
+    },
+    output: output({ type: 'object', additionalProperties: true, properties: { run_id: { type: 'string', required: true }, mode: { type: 'string', required: true } } }),
+    async execute(args) {
+      const runId = requireText(args.run_id, 'run_id')
+      if (args.confirm !== true) throw new Error('clone_submit requires confirm: true — get the user\'s explicit consent before any outward action.')
+      const { paths, record } = await openRun({ settings, runner, artifactsRoot, runId })
+      const attempts = await loadVerifyAttempts(paths)
+      const last = attempts.at(-1)
+      if (last === undefined || !last.ok) throw new Error('No passing clone_verify for this run: nothing may be submitted before the build and tests pass.')
+      const patches = await loadPatches(paths)
+      const files = [...new Set(patches.flatMap(patch => patch.files_changed.map(normalizePath)))].sort()
+      if (files.length === 0) throw new Error('The authorization ledger is empty: there is nothing to submit.')
+      const mode = (args.mode ?? settings.submit.mode) as Settings['submit']['mode']
+      const message = settings.submit.commitMessageTemplate === ''
+        ? `clone refactor(${runId}): deduplicate ${files.length} file(s)`
+        : renderCommitMessage(settings.submit.commitMessageTemplate, { run_id: runId, files_count: String(files.length), timestamp: new Date().toISOString() })
+      const result = await submit({
+        runner, projectRoot: record.project_root, branch: record.branch, remote: settings.submit.remote,
+        baseBranch: settings.submit.baseBranch, files, message,
+        title: args.pr_title ?? `Clone refactor ${runId}`, body: args.pr_body ?? `${files.length} file(s) deduplicated after a passing verification.`,
+        mode, signal: undefined,
+      })
+      return { run_id: runId, mode: result.mode, committed: result.committed, pushed: result.pushed, pr_url: result.pr_url, steps: result.steps }
+    },
+    presentCall: args => ({ card: 'generic', title: 'Clone refactor', kind: 'other', rawInput: `submit ${args.mode ?? ''}` }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'clone_report',
+    description: 'Close the run: check that every cluster has a verdict, then write report.md, findings.json and summary.json under the run directory. Refuses an incomplete run unless allow_partial: true, which reports the gaps instead of hiding them.',
+    parameters: {
+      run_id: { type: 'string', required: true },
+      notes: { type: 'string', description: 'Free text for the report preamble.' },
+      allow_partial: { type: 'boolean', description: 'Render even when some clusters have no verdict; the gaps become part of the report.' },
+    },
+    output: output({ type: 'object', additionalProperties: true, properties: {
+      run_id: { type: 'string', required: true }, report_path: { type: 'string', required: true },
+      findings_path: { type: 'string', required: true }, summary_path: { type: 'string', required: true },
+    } }),
+    async execute(args) {
+      const runId = requireText(args.run_id, 'run_id')
+      const { paths, record } = await openRun({ settings, runner, artifactsRoot, runId })
+      const clusters = await loadJsonlClusters(paths)
+      const { latest, droppedLines } = await loadAssessments(paths)
+      const written = await writeReport(paths, {
+        run: record, clusters, assessments: latest, patches: await loadPatches(paths),
+        verify: await loadVerifyAttempts(paths), job: await latestJob(paths), droppedLines,
+        unauthorized: await loadUnauthorized(paths),
+        notes: args.notes ?? '', allowPartial: args.allow_partial === true, language: settings.reportLanguage,
+      })
+      return asJson({ run_id: runId, report_path: written.report_path, findings_path: written.findings_path, summary_path: written.summary_path, summary: written.summary, digest: written.digest })
+    },
+    presentCall: args => ({ card: 'generic', title: 'Clone refactor', kind: 'other', rawInput: `report ${args.run_id ?? ''}` }),
+  }))
+}
