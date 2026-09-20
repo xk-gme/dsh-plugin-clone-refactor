@@ -81,7 +81,7 @@ index.ts（组合根）→ 唯一的 core/command-host.ts 导入者
 ### Task 1: 插件骨架与配置归一化
 
 **Files:**
-- Create: `package.json`, `cordis.patch.yml`, `tsconfig.json`, `tsdown.config.ts`, `vitest.config.ts`, `.gitignore`, `LICENSE`
+- Create: `package.json`, `cordis.patch.yml`, `tsconfig.json`, `tsdown.config.ts`, `vitest.config.ts`, `.gitignore`, `.gitattributes`, `LICENSE`
 - Create: `src/config.ts`
 - Test: `tests/config.spec.ts`
 
@@ -234,6 +234,15 @@ lib/
 *.tgz
 coverage/
 .DS_Store
+```
+
+`.gitattributes`（与两个姊妹插件一致。全局 `core.autocrlf=true`，没有这个文件新建的源码会被落成 CRLF，与本计划的 Global Constraints 冲突）：
+
+```
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.tgz binary
 ```
 
 `LICENSE`：MIT 全文，版权行 `Copyright (c) 2026 nuaaweixinye`。
