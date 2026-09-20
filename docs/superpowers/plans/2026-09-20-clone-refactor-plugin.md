@@ -1649,8 +1649,9 @@ export function parseNameOnly(text: string): string[] {
 async function capture(runner: CommandRunner, cwd: string, argv: readonly string[]): Promise<string> {
   const result = await runner.run({ argv, cwd, timeoutMs: 60_000, signal: undefined })
   if (result.exitCode !== 0) {
-    const detail = (result.stderr.trim() || result.stdout.trim() || `exit ${String(result.exitCode)}`).slice(0, 500)
-    throw new Error(`${argv.join(' ')} failed in ${cwd}: ${detail}`)
+    // The same rendering as `detail`, not a second copy of it: the local copy this
+    // replaced printed an empty message whenever a failure produced no output.
+    throw new Error(`${argv.join(' ')} failed in ${cwd}: ${detail(result)}`)
   }
   return result.stdout
 }
@@ -1795,6 +1796,8 @@ git commit -m "feat(git): add baseline capture and the authorization reconciliat
 - Produces: `RunRecord`、`artifactsRootOf(settings, env?)`、`openRun(options)`、`loadRun(paths)`
 
 **分支规则（写进使用文档）**：`authorization.enabled` 为真时，建 run 时切到 `clone-refactor/<run_id>`；为假时不切分支（只读 run 不该动用户的 checkout），`run.json` 里记下当时的分支名。
+
+**运行范围：`projectRoot` 必须是跟踪本次目标文件的那个 git 仓库（R23）。** 目标是子模块内的文件（例如 `module/laws/**`）时，就指向该子模块本身。理由不是风格而是正确性：主工程的 `git ls-files` / `git status` / `git diff` 都看不到子模块内部的文件，于是授权对账会把它们一律判为未授权、分区回滚会把它们误判为"本次新建"。跨 superproject + submodule 的单次运行**不在本期范围**，使用文档要写清这一点。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -4765,6 +4768,11 @@ needs a Python checkout with libclang and, for type 3-4, an embeddings endpoint.
 - [ ] **Step 2: 写配置参考 `docs/setup.md` / `docs/setup.zh.md`**
 
 至少覆盖：环境变量与 profile patch 两种配置方式、§12 的完整配置键表、一份**完整的 GME profile 示例**（`verify.steps` 的 build/test/format/restore 取值）、首次自用的一次实测清单（见下）、以及 troubleshooting 表（`detection.scriptPath` 未配置、验证步骤为空、工作区不干净、run 停在 running、UNAUTHORIZED_CHANGES 的含义）。
+
+另有两项**必须**写进使用文档，它们是设计里明确的边界而不是待办：
+
+- **运行范围**：`projectRoot` 必须是跟踪本次目标文件的**那个** git 仓库。目标在子模块内（如 `module/laws/**`）时指向该子模块本身；跨 superproject + submodule 的单次运行不在本期范围。写清"为什么"：主工程的 `git ls-files` / `status` / `diff` 看不到子模块内的文件，会直接导致授权对账判为未授权、分区回滚误判为"本次新建"。
+- **回滚语义**：验证失败且 `verify.keepFailedPatch` 为假时，插件分区回滚 —— 被跟踪的文件恢复到基线，**本次新建的文件会被删除**；任一步失败会抛错并体现在 job 记录与报告中，不会出现"报告说回滚了、实际没回滚"。
 
 首次自用的实测清单（必须照实写进文档，因为 GME 的构建命令在本计划中未经验证）：
 
