@@ -2420,7 +2420,7 @@ git commit -m "feat(detect): add the detector seam and inline structural cluster
 import { afterEach, describe, expect, it } from 'vitest'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { resolveSettings } from '../src/config.ts'
 import { runPaths } from '../src/core/artifacts.ts'
 import { buildDetectionArgv, pythonDetector, redactArgv } from '../src/detect/python.ts'
@@ -2444,7 +2444,9 @@ describe('buildDetectionArgv', () => {
     const argv = buildDetectionArgv({ settings, module: 'base', outputRoot: 'D:/runs/r1/detection' })
     expect(argv.slice(0, 3)).toEqual(['py.exe', '-u', settings.detection.scriptPath])
     expect(argv).toContain('--module'); expect(argv).toContain('base')
-    expect(argv).toContain('--gme-root'); expect(argv).toContain('D:/gme')
+    // `resolveSettings` resolves `projectRoot` natively, so the expected value is
+    // the resolved form rather than the literal one: on Windows `D:/gme` is `D:\gme`.
+    expect(argv).toContain('--gme-root'); expect(argv).toContain(settings.projectRoot)
     expect(argv).toContain('--output-root'); expect(argv).toContain('D:/runs/r1/detection')
     expect(argv).toContain('--libclang'); expect(argv).toContain('D:/llvm/libclang.dll')
     expect(argv).toContain('--embedding-commercial-api-base')
@@ -2483,7 +2485,7 @@ describe('pythonDetector', () => {
     expect(result.provider).toBe('python-pipeline')
     expect(result.clusters).toHaveLength(1)
     expect(result.artifacts[0]?.replaceAll('\\', '/')).toBe(join(paths.detectionDir, 'base', 'func_clone_base.csv').replaceAll('\\', '/'))
-    expect(runner.calls[0]?.cwd).toBe('D:/gme')
+    expect(runner.calls[0]?.cwd).toBe(resolve('D:/gme'))
   })
 
   it('fails with the pipeline log when the command exits non-zero', async () => {
