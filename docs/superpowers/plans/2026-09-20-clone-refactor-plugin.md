@@ -1310,8 +1310,10 @@ describe('fakeRunner', () => {
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `pnpm vitest run tests/command.spec.ts`
-Expected: FAIL —— `Cannot find module '../../src/core/command.ts'`
+Run: `pnpm vitest run tests/command.spec.ts; pnpm run typecheck`
+Expected: `pnpm run typecheck` FAILs —— `TS2307: Cannot find module '../../src/core/command.ts'`
+
+注意：**vitest 这一半不会变红**。`tests/fixtures/fake-runner.ts` 只对 `command.ts` 做 `import type`，而 vitest 会擦除类型导入，所以那两个 fakeRunner 测试在实现存在之前就会通过。因此本任务**还必须**再加至少一个以**值导入**引用 `hostRunner` 的测试（例如 `import { hostRunner } from '../src/core/command-host.ts'`），否则生产实现可以在零运行时覆盖下出厂 —— 真实的 RED 由 `pnpm run typecheck` 提供，运行时的 RED 由这些值导入测试提供。
 
 - [ ] **Step 3: 实现 `src/core/command.ts`**
 
