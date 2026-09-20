@@ -2,63 +2,181 @@
 import { readFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { readJson, type RunPaths } from '../core/artifacts.ts'
-import type { VerifyResult } from '../core/schema.ts'
+import type { ReconcileAudit, VerifyResult } from '../core/schema.ts'
 
-export async function loadVerifyAttempts(paths: RunPaths): Promise<VerifyResult[]> {
-  let names: string[]
-  try {
-    names = await readdir(paths.verifyDir)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
-    throw error
-  }
-  const attempts = await Promise.all(names
-    .filter(name => /^\d+$/.test(name))
-    .map(async name => await readJson<VerifyResult>(join(paths.verifyDir, name, 'result.json'))))
-  return attempts.filter((attempt): attempt is VerifyResult => attempt !== undefined)
-    .sort((left, right) => left.attempt - right.attempt)
+/**
+ * Called for a verify record that exists but could not be read, so a skip is
+ * visible rather than silent.
+ *
+ * The rule is `latestJob`'s, for the same reason: `clone_check` is the only
+ * progress interface this plugin has, so one damaged file may not turn every poll
+ * into an exception — and `clone_report` and `clone_submit`'s own refusal read the
+ * same records through the same readers. The name is the path as a reader of the
+ * run directory sees it: `verify/2/result.json`.
+ */
+export type UnreadableRecord = (name: string, error: Error) => void
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error))
 }
 
-/** Every reconcile audit recorded so far, flattened: what the report calls unauthorized. */
-export async function loadUnauthorized(paths: RunPaths): Promise<string[]> {
-  let names: string[]
-  try {
-    names = await readdir(paths.verifyDir)
-  } catch {
-    return []
-  }
-  const audits = await Promise.all(names
-    .filter(name => /^\d+$/.test(name))
-    .map(async name => await readJson<{ unauthorized?: string[] }>(join(paths.verifyDir, name, 'reconcile.json'))))
-  return [...new Set(audits.flatMap(audit => audit?.unauthorized ?? []))].sort()
+/** A record's name as the report and the refusal render it, relative to the run. */
+function recordName(attempt: number, file: string): string {
+  return `verify/${attempt}/${file}`
 }
 
 /**
- * The tail of the newest step log of the newest attempt. A poller reads this
- * while a build runs, so it stays a bounded slice rather than the whole file.
+ * The numeric attempt directories, ascending.
+ *
+ * The DIRECTORY is the attempt's identity, not the `attempt` field inside it: a
+ * killed attempt has an empty-by-result directory and no result.json at all, and it
+ * still owns its number.
+ */
+async function attemptNumbers(paths: RunPaths): Promise<number[]> {
+  const names = await readdir(paths.verifyDir).catch(() => [])
+  return names.filter(name => /^\d+$/.test(name)).map(Number).sort((left, right) => left - right)
+}
+
+/** The highest attempt directory; `undefined` when no attempt has been recorded. */
+export async function newestAttemptNumber(paths: RunPaths): Promise<number | undefined> {
+  return (await attemptNumbers(paths)).at(-1)
+}
+
+/**
+ * The number the NEXT attempt must take: one past the highest attempt directory.
+ *
+ * Counting result.json files instead reuses the number of an attempt killed before
+ * its result write, which overwrites that attempt's step logs and reconcile.json —
+ * destroying the very evidence the neighbour of this computation preserves.
+ */
+export async function nextAttemptNumber(paths: RunPaths): Promise<number> {
+  return ((await newestAttemptNumber(paths)) ?? 0) + 1
+}
+
+/** The shape a verify result must have for the readers below to be well defined. */
+function asVerifyResult(value: unknown): VerifyResult | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  const result = value as Partial<VerifyResult>
+  return typeof result.attempt === 'number' && typeof result.ok === 'boolean' ? result as VerifyResult : undefined
+}
+
+/** The shape a reconcile audit must have: four arrays, or it is not one. */
+function asReconcileAudit(value: unknown): ReconcileAudit | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  const audit = value as Partial<ReconcileAudit>
+  const arrays = [audit.authorized, audit.changed, audit.unauthorized, audit.missing]
+  return arrays.every(entry => Array.isArray(entry)) ? audit as ReconcileAudit : undefined
+}
+
+/**
+ * Every readable attempt, oldest first. A damaged or unshapeable `result.json` is
+ * skipped and named, never an exception.
+ */
+export async function loadVerifyAttempts(paths: RunPaths, onUnreadable?: UnreadableRecord): Promise<VerifyResult[]> {
+  const found: Array<{ attempt: number, result: VerifyResult }> = []
+  for (const attempt of await attemptNumbers(paths)) {
+    const file = join(paths.verifyDir, String(attempt), 'result.json')
+    let parsed: unknown
+    try {
+      parsed = await readJson(file)
+    } catch (error) {
+      onUnreadable?.(recordName(attempt, 'result.json'), asError(error))
+      continue
+    }
+    // A missing file is an attempt that never finished, which the gate refuses on its
+    // own terms; only a file that EXISTS and cannot be consumed is damage.
+    if (parsed === undefined) continue
+    const result = asVerifyResult(parsed)
+    if (result === undefined) {
+      onUnreadable?.(recordName(attempt, 'result.json'), new Error(`${recordName(attempt, 'result.json')} is not a verification result`))
+      continue
+    }
+    found.push({ attempt, result })
+  }
+  return found.sort((left, right) => left.attempt - right.attempt).map(entry => entry.result)
+}
+
+/** Every attempt's reconcile audit, keyed by attempt number. */
+export async function loadReconcileAudits(paths: RunPaths, onUnreadable?: UnreadableRecord): Promise<Map<number, ReconcileAudit>> {
+  const audits = new Map<number, ReconcileAudit>()
+  for (const attempt of await attemptNumbers(paths)) {
+    const file = join(paths.verifyDir, String(attempt), 'reconcile.json')
+    let parsed: unknown
+    try {
+      parsed = await readJson(file)
+    } catch (error) {
+      onUnreadable?.(recordName(attempt, 'reconcile.json'), asError(error))
+      continue
+    }
+    if (parsed === undefined) continue
+    const audit = asReconcileAudit(parsed)
+    if (audit === undefined) {
+      onUnreadable?.(recordName(attempt, 'reconcile.json'), new Error(`${recordName(attempt, 'reconcile.json')} is not a reconcile audit`))
+      continue
+    }
+    audits.set(attempt, audit)
+  }
+  return audits
+}
+
+export interface UnauthorizedRead {
+  /** The newest attempt's unauthorized list: the freeze claim, newest-wins. */
+  files: string[]
+  /** Files an OLDER attempt found unauthorized and the newest one no longer does. */
+  resolved: string[]
+}
+
+/**
+ * The freeze claim, from the attempt the submit gate reads.
+ *
+ * The union of every attempt's audit claimed a freeze forever: the operator reverts
+ * the file, attempt 2 reconciles clean, verification passes, the run is submitted and
+ * closed — and the report still says it is frozen and must not be verified. Every
+ * other verdict in the report is newest-wins, and the claim has to be too. The older
+ * findings are kept as `resolved` so the history stays auditable.
+ */
+export function unauthorizedClaim(audits: ReadonlyMap<number, ReconcileAudit>): UnauthorizedRead {
+  const numbers = [...audits.keys()].sort((left, right) => left - right)
+  const newest = numbers.at(-1)
+  if (newest === undefined) return { files: [], resolved: [] }
+  const files = [...new Set(audits.get(newest)?.unauthorized ?? [])].sort()
+  const older = new Set(numbers.filter(attempt => attempt !== newest).flatMap(attempt => audits.get(attempt)?.unauthorized ?? []))
+  return { files, resolved: [...older].filter(file => !files.includes(file)).sort() }
+}
+
+/** The freeze claim of this run's verify attempts. */
+export async function loadUnauthorized(paths: RunPaths, onUnreadable?: UnreadableRecord): Promise<UnauthorizedRead> {
+  return unauthorizedClaim(await loadReconcileAudits(paths, onUnreadable))
+}
+
+/** The step index a log file name carries: the writer emits `${index}-${name}.log`. */
+function logIndex(name: string): number {
+  const match = /^(\d+)-/.exec(name)
+  return match === null ? -1 : Number(match[1])
+}
+
+/**
+ * The tail of the newest step log of the newest attempt. A poller reads this while
+ * a build runs, so it stays a bounded slice rather than the whole file.
+ *
+ * The step index is parsed, not compared as a string: names are unpadded, so
+ * `"10-x.log" < "2-y.log"` lexically and ten or more steps returned step 9's log
+ * while step 10+ was running. The directory is the newest ATTEMPT, not the newest
+ * readable result: that is what makes this the live window for the attempt running
+ * now rather than for the last one that finished.
  */
 export async function readNewestVerifyLog(
   paths: RunPaths,
   lines: number,
 ): Promise<{ file: string; lines: string[] } | undefined> {
-  const attempts = await loadVerifyAttempts(paths)
-  const newest = attempts.at(-1)
-  const directory = newest === undefined
-    ? await newestAttemptDir(paths)
-    : join(paths.verifyDir, String(newest.attempt))
-  if (directory === undefined) return undefined
-  const names = (await readdir(directory).catch(() => [])).filter(name => name.endsWith('.log')).sort()
-  const file = names.at(-1)
+  const newest = await newestAttemptNumber(paths)
+  if (newest === undefined) return undefined
+  const directory = join(paths.verifyDir, String(newest))
+  const names = (await readdir(directory).catch(() => [])).filter(name => name.endsWith('.log'))
+  const file = names.sort((left, right) => logIndex(left) - logIndex(right) || left.localeCompare(right)).at(-1)
   if (file === undefined) return undefined
   const absolute = join(directory, file)
   const text = await readFile(absolute, 'utf8').catch(() => '')
   const all = text.split('\n')
   return { file: absolute, lines: all.slice(Math.max(0, all.length - lines)) }
-}
-
-/** The highest-numbered attempt directory, when no result.json has been written yet. */
-async function newestAttemptDir(paths: RunPaths): Promise<string | undefined> {
-  const names = (await readdir(paths.verifyDir).catch(() => [])).filter(name => /^\d+$/.test(name))
-  const highest = names.map(Number).sort((left, right) => left - right).at(-1)
-  return highest === undefined ? undefined : join(paths.verifyDir, String(highest))
 }

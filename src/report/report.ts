@@ -24,8 +24,16 @@ export interface ReportInput {
   verify: readonly VerifyResult[]
   job: JobRecord | undefined
   droppedLines: readonly number[]
-  /** Files a reconcile audit found changed without authorization: never hidden. */
+  /**
+   * Files the newest reconcile audit found changed without authorization: never
+   * hidden. This is the FREEZE CLAIM — the same attempt `clone_submit` reads — not
+   * the union of every attempt (see `resolvedUnauthorized`).
+   */
   unauthorized: readonly string[]
+  /** Files an older attempt found unauthorized and the newest attempt no longer does. */
+  resolvedUnauthorized: readonly string[]
+  /** Durable records that could not be read at all: a skip must be visible. */
+  unreadableRecords: readonly string[]
   notes: string
   allowPartial: boolean
   language: 'zh' | 'en'
@@ -37,6 +45,10 @@ export interface ReportSummary extends Summary {
   detection_provider: string
   cluster_path: string
   unauthorized_files: string[]
+  /** The earlier freeze findings, kept for audit and explicitly marked resolved. */
+  resolved_unauthorized_files: string[]
+  /** `<id>.json` and `verify/<n>/<file>` records that could not be read. */
+  unreadable_records: string[]
   unverified: boolean
   dropped_lines: number
 }
@@ -50,9 +62,11 @@ export function summarizeReport(input: ReportInput): ReportSummary {
     baseline_head: input.run.baseline.head,
     detection_provider: input.run.detection_provider,
     cluster_path: input.run.cluster_path,
-    // Straight from the reconcile audits: a file git changed that the ledger never
-    // authorized is the single most important thing a report can surface.
+    // Straight from the newest reconcile audit: a file git changed that the ledger
+    // never authorized is the single most important thing a report can surface.
     unauthorized_files: [...new Set(input.unauthorized)].sort(),
+    resolved_unauthorized_files: [...new Set(input.resolvedUnauthorized)].sort(),
+    unreadable_records: [...new Set(input.unreadableRecords)].sort(),
     // A patched cluster whose verification never completed is not a success, and
     // the summary has to say so whether the attempt failed or the job's terminal
     // record never landed: `running` means "no terminal record", not "interrupted".
@@ -99,13 +113,23 @@ function clusterLine(cluster: Cluster, assessment: Assessment | undefined): stri
 }
 
 /**
- * Why a failed attempt left the work tree alone. The two deliberate suppressions are
- * the dirty baseline — there is no baseline worth restoring to, and a restore would
- * destroy the operator's own uncommitted work — and `verify.keepFailedPatch`. Printing
- * nothing would make "we chose not to roll back" read exactly like "rollback was never
- * a question".
+ * Why a failed attempt left the work tree alone.
+ *
+ * The FAILED rollback comes first, because it is the only one of these facts that
+ * means the failed patch is still there: `checkoutFiles` threw, and the report used
+ * to fall through to "no rollback files were recorded" — telling the operator that
+ * nothing needed rolling back. The real reason existed only in the job error, which
+ * a later job can supersede. The two deliberate suppressions are the dirty baseline
+ * — there is no baseline worth restoring to, and a restore would destroy the
+ * operator's own uncommitted work — and `verify.keepFailedPatch`. Printing nothing
+ * would make "we chose not to roll back" read exactly like "rollback was never a
+ * question".
  */
-function rollbackSkipReason(input: ReportInput): string {
+function rollbackSkipReason(input: ReportInput, attempt: VerifyResult): string {
+  const failure = attempt.rollback_error?.trim() ?? ''
+  if (failure !== '') {
+    return `自动回滚失败 / automatic rollback failed, so the failed patch is still in the work tree: ${failure}`
+  }
   if (input.run.baseline.dirty.length > 0) {
     return '基线不干净，自动回滚已按 `workdir.allowDirty` 的语义停用（回滚会把开跑前就有的改动一起抹掉）'
   }
@@ -210,7 +234,7 @@ export function renderReport(input: ReportInput): string {
       if (attempt.rolled_back) {
         lines.push('', `已回滚 / rolled back: ${attempt.rollback_files.map(file => `\`${cell(file)}\``).join(', ')}`)
       } else if (!attempt.ok) {
-        lines.push('', `未回滚 / not rolled back: ${rollbackSkipReason(input)}`)
+        lines.push('', `未回滚 / not rolled back: ${rollbackSkipReason(input, attempt)}`)
       }
       lines.push('')
     }
@@ -222,8 +246,24 @@ export function renderReport(input: ReportInput): string {
       '- 这些文件被改动，但不在授权账本里；本 run 已冻结，不得验证或提交：',
       ...summary.unauthorized_files.map(file => `  - \`${file}\``), '')
   }
+  if (summary.resolved_unauthorized_files.length > 0) {
+    // The freeze claim comes from the NEWEST reconcile audit, so an earlier finding
+    // the newest attempt no longer repeats is history, not the run's state. Printing
+    // it under the frozen heading made a finished, submitted run read as frozen.
+    lines.push('## 已解决的冻结 / Resolved freeze', '',
+      `- 较早的尝试发现这些文件被改动但未授权；最新一次 reconcile（attempt ${input.verify.at(-1)?.attempt ?? '-'}）已不含它们，**本 run 未被冻结**：`,
+      ...summary.resolved_unauthorized_files.map(file => `  - \`${file}\``), '')
+  }
   if (input.job !== undefined) {
     lines.push('## 最近的后台任务 / Last job', '', `- \`${input.job.job_id}\` (${input.job.kind}) → **${input.job.status}**${input.job.error === null ? '' : `: ${input.job.error}`}`, ...(input.job.status === 'running' ? ['- 停在 running 说明没有终态记录：要么任务被中断，要么终态写盘失败（任务本身可能已经成功）。两种情况都不算成功。'] : []), '')
+  }
+  if (summary.unreadable_records.length > 0) {
+    // A corrupt record is skipped so the run stays observable, and named here so the
+    // skip is not silent: an unreadable NEWEST job record would otherwise make this
+    // section present an older job as the run's last one.
+    lines.push('## 无法读取 / unreadable records', '',
+      '- 这些记录存在但无法解析，已被跳过（不是"没有记录"）：',
+      ...summary.unreadable_records.map(file => `  - \`${file}\``), '')
   }
   if (input.droppedLines.length > 0) {
     lines.push('## 跳过的账本行 / Dropped ledger lines', '', `- findings 中 ${input.droppedLines.length} 行不是合法 JSON（行号：${input.droppedLines.join(', ')}）`, '')

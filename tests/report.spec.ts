@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runPaths } from '../src/core/artifacts.ts'
+import type { JobRecord } from '../src/core/jobs.ts'
 import { resolveSettings } from '../src/config.ts'
 import { renderReport, summarizeReport, writeReport, type ReportInput } from '../src/report/report.ts'
 import type { Assessment, Cluster, PatchRecord, VerifyResult } from '../src/core/schema.ts'
@@ -54,6 +55,8 @@ function input(overrides: Partial<ReportInput> = {}): ReportInput {
     job: undefined,
     droppedLines: [],
     unauthorized: [],
+    resolvedUnauthorized: [],
+    unreadableRecords: [],
     notes: '',
     allowPartial: false,
     language: 'zh',
@@ -253,6 +256,74 @@ describe('renderReport', () => {
     expect(text).toContain('未执行')
     expect(text).toContain('test-debug')
     expect(text).toContain('本次共配置 2 步，实际执行 1 步')
+  })
+
+  it('explains a rollback that FAILED, instead of claiming there was nothing to roll back', () => {
+    // `checkoutFiles` threw, so the second write that would have recorded the outcome
+    // never happened and `rolled_back` stayed false. Falling through to the last
+    // branch told the operator nothing needed rolling back while the failed patch was
+    // still in their tree.
+    const failed: VerifyResult = {
+      attempt: 1, ok: false, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      rolled_back: false, rollback_files: [],
+      rollback_error: 'Cannot roll back module/laws/src/a.cpp: error: pathspec did not match any file(s) known to git',
+      steps: [{ name: 'build', phase: 'build', command: 'msbuild t.sln', required: true, always: false, exit_code: 1, ok: false, timed_out: false, log_file: 'D:/runs/run-1/verify/1/1-build.log', lossy: false }],
+    }
+    const complete = new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]])
+    const text = renderReport(input({ verify: [failed], assessments: complete }))
+    expect(text).toContain('未回滚 / not rolled back')
+    expect(text).toContain('自动回滚失败')
+    expect(text).toContain('Cannot roll back module/laws/src/a.cpp')
+    expect(text).not.toContain('没有记录到回滚文件')
+  })
+
+  it('stops claiming a freeze once the newest attempt reconciled clean', () => {
+    // Attempt 1 found a file outside the ledger and the run froze (correctly); the
+    // operator reverted it and attempt 2 reconciled clean. The freeze claim came from
+    // the UNION of every attempt ever recorded, so a finished, submitted run printed
+    // "this run is frozen and must not be verified or submitted".
+    const failed: VerifyResult = {
+      attempt: 1, ok: false, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      rolled_back: false, rollback_files: [],
+      steps: [{ name: 'build', phase: 'build', command: 'msbuild t.sln', required: true, always: false, exit_code: 1, ok: false, timed_out: false, log_file: 'D:/runs/run-1/verify/1/1-build.log', lossy: false }],
+    }
+    const passed: VerifyResult = {
+      attempt: 2, ok: true, started_at: '2026-09-20T01:00:00.000Z', finished_at: '2026-09-20T01:10:00.000Z',
+      rolled_back: false, rollback_files: [],
+      steps: [{ name: 'build', phase: 'build', command: 'msbuild t.sln', required: true, always: false, exit_code: 0, ok: true, timed_out: false, log_file: 'D:/runs/run-1/verify/2/1-build.log', lossy: false }],
+    }
+    const complete = new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]])
+    const resolved = input({
+      verify: [failed, passed], assessments: complete,
+      unauthorized: [], resolvedUnauthorized: ['module/laws/src/sneaky.cpp'],
+    })
+    const text = renderReport(resolved)
+    expect(text).not.toContain('## 未授权改动')
+    expect(text).not.toContain('本 run 已冻结')
+    // The history is kept and MARKED resolved, so the earlier freeze stays auditable
+    // without being claimed as the run's current state.
+    expect(text).toContain('已解决')
+    expect(text).toMatch(/sneaky\.cpp/)
+    expect(summarizeReport(resolved).unauthorized_files).toEqual([])
+    expect(summarizeReport(resolved).resolved_unauthorized_files).toEqual(['module/laws/src/sneaky.cpp'])
+  })
+
+  it('names an unreadable job record instead of reporting an older job as the last one', () => {
+    // A corrupt `<id>.json` is skipped by `latestJob`, so the "last job" section would
+    // silently present an OLDER job — in the artefact meant for audit. The skip has to
+    // be visible.
+    const job: JobRecord = {
+      job_id: 'scan-20260920-010000-aaaa', run_id: 'run-1', kind: 'scan', status: 'succeeded',
+      started_at: '2026-09-20T01:00:00.000Z', finished_at: '2026-09-20T01:01:00.000Z', error: null, summary: '1 cluster(s)',
+    }
+    const corrupt = 'verify-20260920-050000-cccc.json'
+    const named = input({ job, unreadableRecords: [corrupt] })
+    const text = renderReport(named)
+    expect(text).toContain('无法读取 / unreadable')
+    expect(text).toContain(corrupt)
+    // The older job is still reported, and the report says which file it could not read.
+    expect(text).toContain('scan-20260920-010000-aaaa')
+    expect(summarizeReport(named).unreadable_records).toEqual([corrupt])
   })
 })
 

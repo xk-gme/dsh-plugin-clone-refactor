@@ -85,7 +85,15 @@ export async function submit(input: SubmitInput): Promise<SubmitResult> {
   if (input.files.length === 0) throw new Error('Cannot commit: no authorized files. Record a patched verdict with files_changed first.')
   await assertOnRunBranch(input)
   await run(input, ['git', 'add', '--', ...input.files], steps)
-  await run(input, ['git', 'commit', '-m', input.message], steps)
+  // `--only` (with the same pathspec) is what keeps the commit to the ledger.
+  // A bare `git commit` commits the WHOLE INDEX, so `git add -- <files>` bounded
+  // nothing: with `workdir.allowDirty: true` — the documented profile of an operator
+  // who has work in progress — a pre-existing STAGED change to a file nobody
+  // authorized was swept into this commit and pushed under a message that counts
+  // ledger files only. `--only -- <paths>` commits exactly those paths and leaves the
+  // rest of the index untouched. The `git add` above is still required: an untracked
+  // file the run created has no index entry for `--only` to commit.
+  await run(input, ['git', 'commit', '--only', '-m', input.message, '--', ...input.files], steps)
   result.committed = true
   if (input.mode === 'commit') return result
   await run(input, ['git', 'push', '-u', input.remote, input.branch], steps)

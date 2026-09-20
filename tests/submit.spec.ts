@@ -54,7 +54,23 @@ describe('submit', () => {
     expect(runner.calls.map(call => call.argv.join(' '))).toEqual([
       BRANCH_CHECK,
       'git add -- module/laws/src/a.cpp',
-      'git commit -m refactor: dedupe ComputeArea',
+      'git commit --only -m refactor: dedupe ComputeArea -- module/laws/src/a.cpp',
+    ])
+  })
+
+  it('narrows the commit itself to the ledger, not only the `git add`', async () => {
+    // `git add -- <files>` followed by a bare `git commit` commits the WHOLE INDEX:
+    // with `workdir.allowDirty: true` — the documented profile of an operator with
+    // work in progress — a pre-existing STAGED change is swept into the clone
+    // refactor commit and pushed under a message that counts ledger files only.
+    // `--only -- <files>` is the boundary `git add` alone never was. Verified against
+    // real git: the bare form committed a staged unrelated file, the `--only` form
+    // left it staged and committed only the ledger paths.
+    const runner = fakeRunner([ON_RUN_BRANCH, ['git add', {}], ['git commit', {}]])
+    await submit({ ...BASE, runner, mode: 'commit' })
+    const commit = runner.calls.find(call => call.argv[1] === 'commit')
+    expect(commit?.argv).toEqual([
+      'git', 'commit', '--only', '-m', 'refactor: dedupe ComputeArea', '--', 'module/laws/src/a.cpp',
     ])
   })
 
@@ -67,7 +83,7 @@ describe('submit', () => {
     expect(runner.calls.map(call => call.argv.join(' '))).toEqual([
       BRANCH_CHECK,
       'git add -- module/laws/src/a.cpp',
-      'git commit -m refactor: dedupe ComputeArea',
+      'git commit --only -m refactor: dedupe ComputeArea -- module/laws/src/a.cpp',
       'git push -u origin clone-refactor/run-1',
     ])
   })
@@ -81,7 +97,7 @@ describe('submit', () => {
     expect(runner.calls.map(call => call.argv.join(' '))).toEqual([
       BRANCH_CHECK,
       'git add -- module/laws/src/a.cpp',
-      'git commit -m refactor: dedupe ComputeArea',
+      'git commit --only -m refactor: dedupe ComputeArea -- module/laws/src/a.cpp',
       'git push -u origin clone-refactor/run-1',
       'gh pr create --base main --head clone-refactor/run-1 --title Clone refactor run-1 --body Deduplicated one clone family.',
     ])
@@ -137,7 +153,9 @@ describe('submit', () => {
       ['git add', {}], ['git commit', {}],
     ])
     await expect(submit({ ...BASE, runner, mode: 'commit' })).rejects.toThrow(/clone-refactor\/run-1/)
-    expect(runner.calls.some(call => call.argv.join(' ') === 'git commit -m refactor: dedupe ComputeArea')).toBe(false)
+    // Nothing outward at all: a version comparison would be vacuous once the argv
+    // changed, so the verb itself is what is asserted absent.
+    expect(runner.calls.some(call => call.argv[1] === 'commit')).toBe(false)
   })
 
   it('commits when HEAD really is on the run branch', async () => {
@@ -150,7 +168,7 @@ describe('submit', () => {
     expect(runner.calls.map(call => call.argv.join(' '))).toEqual([
       'git rev-parse --abbrev-ref HEAD',
       'git add -- module/laws/src/a.cpp',
-      'git commit -m refactor: dedupe ComputeArea',
+      'git commit --only -m refactor: dedupe ComputeArea -- module/laws/src/a.cpp',
     ])
   })
 })

@@ -7,7 +7,7 @@ import { PRIORITIES, PRIORITY_RANK, type Settings } from './config.ts'
 import { writeAtomic } from './core/artifacts.ts'
 import { loadJsonlClusters, loadScanRevision, saveJsonlClusters } from './core/clusters.ts'
 import { coverageGaps, loadAssessments, loadPatches, recordAssessment, savePatches } from './core/ledger.ts'
-import { detach, latestJob, startJob, type PersistFailure } from './core/jobs.ts'
+import { detach, latestJob, latestVerifyJob, startJob, type PersistFailure } from './core/jobs.ts'
 import { normalizePath } from './core/paths.ts'
 import { newRunId } from './core/artifacts.ts'
 import { openRun, requireRun, saveRun } from './core/run.ts'
@@ -18,7 +18,8 @@ import { changedFiles, checkoutFiles } from './git/baseline.ts'
 import { reconcile } from './git/reconcile.ts'
 import { writeReport } from './report/report.ts'
 import { renderCommitMessage, submit } from './submit.ts'
-import { loadUnauthorized, loadVerifyAttempts, readNewestVerifyLog } from './verify/artifacts.ts'
+import { loadReconcileAudits, loadUnauthorized, loadVerifyAttempts, newestAttemptNumber, nextAttemptNumber, readNewestVerifyLog } from './verify/artifacts.ts'
+import { submitGate } from './verify/gate.ts'
 import { runVerification } from './verify/engine.ts'
 
 const EVIDENCE = { type: 'object', additionalProperties: false, properties: {
@@ -176,7 +177,18 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
           unreadableJobs.push(name)
           ctx.logger.warn(`gme-clone-refactor: ignoring unreadable job record ${name}: ${error.message}`)
         })
-        return asJson({ run_id: runId, what: 'status', job: job ?? null, unreadable_jobs: unreadableJobs })
+        // The verify records come from the same poll and follow the same rule: a
+        // damaged `verify/<n>/result.json` must be skip-and-name, not an exception
+        // that takes down the only progress interface this plugin has.
+        const unreadableAttempts: string[] = []
+        await loadVerifyAttempts(paths, (name, error) => {
+          unreadableAttempts.push(name)
+          ctx.logger.warn(`gme-clone-refactor: ignoring unreadable verification record ${name}: ${error.message}`)
+        })
+        return asJson({
+          run_id: runId, what: 'status', job: job ?? null,
+          unreadable_jobs: unreadableJobs, unreadable_attempts: unreadableAttempts,
+        })
       }
       if (args.what === 'ledger') {
         const { latest, droppedLines, patches } = await currentLedger(paths)
@@ -332,8 +344,13 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       if (settings.verify.steps.length === 0) {
         throw new Error('verify.steps is empty, so nothing can be verified: configure this site\'s build/test steps before running clone_verify. An unverified patch must not be submitted.')
       }
-      const { patches } = await currentLedger(paths)
+      const { patches, revision } = await currentLedger(paths)
       const authorized = authorizedFiles(patches)
+      // The moment the authorization set THIS attempt verifies was read. A patch
+      // recorded after it was not part of that set, whatever the file lists say later,
+      // and `clone_submit` refuses on exactly this timestamp — recording the fact is
+      // what makes "authorized after the verification" detectable at all.
+      const reconciledAt = new Date().toISOString()
       // One guarded read, in `git/baseline.ts`, for exactly this reconcile. The
       // authorization gate is only as good as the change set it reads: an
       // unreadable status or diff leaves `stdout` empty or partial, `reconcile`
@@ -341,30 +358,52 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       // guard refuses such a read instead of reconciling against it.
       const changed = await changedFiles(runner, record.project_root, record.baseline.head)
       const audit = reconcile(authorized, changed)
-      const attempt = (await loadVerifyAttempts(paths)).length + 1
-      await writeAtomic(join(paths.verifyDir, String(attempt), 'reconcile.json'), `${JSON.stringify({ authorized, changed, ...audit }, null, 2)}\n`)
+      // One past the highest attempt DIRECTORY, never the count of result.json files:
+      // an attempt killed before its result write would otherwise have its number
+      // reused, overwriting its step logs and reconcile.json.
+      const attempt = await nextAttemptNumber(paths)
+      await writeAtomic(join(paths.verifyDir, String(attempt), 'reconcile.json'), `${JSON.stringify({
+        authorized, changed, ...audit,
+        cluster_ids: patches.map(patch => patch.cluster_id),
+        ...(revision === undefined ? {} : { scan_revision: revision }),
+        recorded_at: reconciledAt,
+      }, null, 2)}\n`)
       if (audit.unauthorized.length > 0) {
         throw new Error(`UNAUTHORIZED_CHANGES: ${audit.unauthorized.join(', ')} changed but is not in the authorization ledger. This run is frozen: resolve or revert those files before verifying or submitting.`)
       }
       const job = await startJob(paths, runId, 'verify')
       detach(paths, job, async () => {
         const result = await runVerification({ runner, paths, steps: settings.verify.steps, cwd: record.project_root, attempt, signal: undefined })
+        const resultPath = join(paths.verifyDir, String(attempt), 'result.json')
         // Persist the outcome BEFORE the rollback. `checkoutFiles` throws when git
         // refuses, and a throw here rejects the detached task, so writing last would
         // leave the attempt with step logs but no result.json: the report would say
         // no verification ran, and the next attempt would reuse this number and
         // overwrite those logs. The evidence that verification ran is not the
         // rollback's to erase.
-        await writeAtomic(join(paths.verifyDir, String(attempt), 'result.json'), `${JSON.stringify(result, null, 2)}\n`)
+        await writeAtomic(resultPath, `${JSON.stringify(result, null, 2)}\n`)
         // 自动回滚只在干净基线上才安全。`workdir.allowDirty` 意味着操作者手上本来就有
         // 未提交的工作：对被跟踪文件执行 `git restore --source=HEAD` 会抹掉他开跑前的
         // 改动，对未跟踪文件执行 `git clean` 会删掉他开跑前就存在的文件。此时只记录
         // 失败、把工作区原样留给他处理（`rolled_back: false` 会出现在报告里）。
         if (!result.ok && !record.settings.verify.keepFailedPatch && authorized.length > 0 && record.baseline.dirty.length === 0) {
-          await checkoutFiles(runner, record.project_root, authorized)
-          result.rolled_back = true
-          result.rollback_files = authorized
-          await writeAtomic(join(paths.verifyDir, String(attempt), 'result.json'), `${JSON.stringify(result, null, 2)}\n`)
+          let rollbackError: unknown
+          try {
+            await checkoutFiles(runner, record.project_root, authorized)
+            result.rolled_back = true
+            result.rollback_files = authorized
+          } catch (error) {
+            // The failure is recorded HERE as well as in the job error: the job error
+            // can be superseded by a later job, and the report would otherwise fall
+            // through to "no rollback files were recorded" — telling the operator
+            // nothing needed rolling back while the failed patch is still in the tree.
+            rollbackError = error
+            result.rollback_error = error instanceof Error ? error.message : String(error)
+          }
+          // Written in both directions: the outcome of the rollback is what the
+          // report reads, whichever way it went.
+          await writeAtomic(resultPath, `${JSON.stringify(result, null, 2)}\n`)
+          if (rollbackError !== undefined) throw rollbackError
         }
         return result
       }, result => `attempt ${result.attempt}: ${result.ok ? 'PASS' : 'FAIL'}`, info => { reportPersistFailure(ctx, info) })
@@ -375,7 +414,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
 
   ctx.tools.register(defineTool({
     name: 'clone_submit',
-    description: 'Commit, push and optionally open a pull request for the authorized files — only after a passing clone_verify. Requires confirm: true; without it the call fails and nothing outward happens.',
+    description: 'Commit, push and optionally open a pull request for the authorized files — only after a passing clone_verify, and only for the ledger and tree that verification reconciled: a patch authorized after it (a widened files_changed, a new cluster, a retracted one, a rescan) is refused and needs a fresh clone_verify. Requires confirm: true; without it the call fails and nothing outward happens.',
     parameters: {
       run_id: { type: 'string', required: true },
       confirm: { type: 'boolean', required: true, description: 'Set true only after the user explicitly agreed to this submission.' },
@@ -387,12 +426,33 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       const runId = requireText(args.run_id, 'run_id')
       if (args.confirm !== true) throw new Error('clone_submit requires confirm: true — get the user\'s explicit consent before any outward action.')
       const { paths, record } = await requireRun(artifactsRoot, runId)
-      const attempts = await loadVerifyAttempts(paths)
-      const last = attempts.at(-1)
-      if (last === undefined || !last.ok) throw new Error('No passing clone_verify for this run: nothing may be submitted before the build and tests pass.')
-      const { patches } = await currentLedger(paths)
+      const { patches, revision } = await currentLedger(paths)
       const files = authorizedFiles(patches)
+      // An empty ledger is nothing to submit whatever the verify ledger says, so this
+      // check comes FIRST: a retracted authorization (R49) is then refused for the
+      // reason that is actually true, instead of being told no verification passed.
       if (files.length === 0) throw new Error('The authorization ledger is empty: there is nothing to submit.')
+      // Every verify record is read through the visible-skip hook, so a damaged file
+      // refuses submission with a readable reason rather than a JSON parse error.
+      const unreadable: string[] = []
+      const noteUnreadable = (name: string, error: Error): void => {
+        unreadable.push(name)
+        ctx.logger.warn(`gme-clone-refactor: ignoring unreadable verification record ${name}: ${error.message}`)
+      }
+      const attempts = await loadVerifyAttempts(paths, noteUnreadable)
+      const newestAttempt = await newestAttemptNumber(paths)
+      const audits = await loadReconcileAudits(paths, noteUnreadable)
+      // The precondition is not "some attempt passed": it is that the attempt passed,
+      // its JOB settled successfully, and the ledger and tree it reconciled are still
+      // the ledger and tree this commit would take (see `src/verify/gate.ts`).
+      const gate = submitGate({
+        attempts,
+        newestAttempt,
+        verifyJob: await latestVerifyJob(paths, noteUnreadable),
+        audit: newestAttempt === undefined ? undefined : audits.get(newestAttempt),
+        patches, revision, files, unreadable,
+      })
+      if (!gate.allowed) throw new Error(gate.reason)
       const mode = (args.mode ?? settings.submit.mode) as Settings['submit']['mode']
       const message = settings.submit.commitMessageTemplate === ''
         ? `clone refactor(${runId}): deduplicate ${files.length} file(s)`
@@ -427,10 +487,24 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       // authorizations must all belong to the same scan revision, or the closing
       // report pairs a new cluster with an old cluster's verdict text.
       const { clusters, latest, droppedLines, patches } = await currentLedger(paths)
+      // Every durable record is read through the visible-skip hook: a corrupt file is
+      // reported by name rather than dropped. Without it a corrupt NEWEST job record
+      // made this report present an older job as the run's last one.
+      const unreadableRecords: string[] = []
+      const noteUnreadable = (name: string, error: Error): void => {
+        unreadableRecords.push(name)
+        ctx.logger.warn(`gme-clone-refactor: ignoring unreadable record ${name}: ${error.message}`)
+      }
+      const verify = await loadVerifyAttempts(paths, noteUnreadable)
+      const job = await latestJob(paths, noteUnreadable)
+      // The freeze claim is the newest attempt's, the same one the submit gate reads —
+      // not the union of every attempt, which made a finished run read as frozen.
+      const unauthorized = await loadUnauthorized(paths, noteUnreadable)
       const written = await writeReport(paths, {
-        run: record, clusters, assessments: latest, patches,
-        verify: await loadVerifyAttempts(paths), job: await latestJob(paths), droppedLines,
-        unauthorized: await loadUnauthorized(paths),
+        run: record, clusters, assessments: latest, patches, verify, job, droppedLines,
+        unauthorized: unauthorized.files,
+        resolvedUnauthorized: unauthorized.resolved,
+        unreadableRecords,
         notes: args.notes ?? '', allowPartial: args.allow_partial === true, language: settings.reportLanguage,
       })
       return asJson({ run_id: runId, report_path: written.report_path, findings_path: written.findings_path, summary_path: written.summary_path, summary: written.summary, digest: written.digest })

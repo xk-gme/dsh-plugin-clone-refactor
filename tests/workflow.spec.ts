@@ -604,19 +604,17 @@ describe('clone_submit', () => {
 
   it('has nothing to submit when the authorization ledger is empty', async () => {
     // The point of R49: an empty ledger is what makes a retracted authorization
-    // impossible to act on. The passing attempt is seeded directly so a ledger
-    // check is the only thing that can refuse this call.
+    // impossible to act on. This check runs BEFORE the verification gate — a run with
+    // nothing authorized has nothing to submit, whatever the verify ledger says — so
+    // the test needs no verify record at all. It used to seed a bare `result.json` by
+    // hand, which is how the old gate came to trust a hand-written file as proof of a
+    // passing verification; the gate's own tests now pin that a record-less attempt is
+    // refused rather than accepted.
     const root = await workspace()
     const runner = fakeRunner(GIT_OK)
     const ctx = await mount({ projectRoot: 'D:/repo', artifactsRoot: join(root, 'runs') }, runner)
     await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
     await settle(ctx, 'r1')
-    const { runPaths, writeAtomic } = await import('../src/core/artifacts.ts')
-    const paths = runPaths(join(root, 'runs'), 'r1')
-    await writeAtomic(join(paths.verifyDir, '1', 'result.json'), `${JSON.stringify({
-      attempt: 1, ok: true, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:00:01.000Z',
-      steps: [], rolled_back: false, rollback_files: [],
-    }, null, 2)}\n`)
 
     const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
     expect((submitted as { isError?: boolean }).isError).toBe(true)
@@ -929,6 +927,17 @@ describe('clone_verify auto-rollback', () => {
     expect(status.job?.error).toMatch(/Cannot roll back/)
     // And the next attempt must not be numbered 1 again.
     await expect(loadVerifyAttemptsOf(root)).resolves.toEqual([1])
+
+    // The report must explain the REAL reason the patch is still in the tree. The
+    // rollback's failure lived only in the job error, so `rollbackSkipReason` fell
+    // through to "no rollback files were recorded" — telling the operator nothing
+    // needed rolling back while the failed patch was still there.
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError, rendered(reported)).not.toBe(true)
+    const report = await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')
+    expect(report).toContain('自动回滚失败')
+    expect(report).toContain('Cannot roll back module/laws/src/a.cpp')
+    expect(report).not.toContain('没有记录到回滚文件')
   })
 
   it('leaves a failed patch alone when the baseline was already dirty', async () => {
@@ -1142,5 +1151,302 @@ describe('the whole chain', () => {
     expect(frozen).toMatch(/UNAUTHORIZED_CHANGES/)
     expect(frozen).toMatch(/sneaky\.cpp/)
     expect(frozen).not.toMatch(/module\/laws\/src\/a\.cpp/)
+  })
+})
+
+describe('the submit gate is bound to the verification it claims', () => {
+  const STEPS = { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] }
+  const PATCHED_FILE = 'module/laws/src/a.cpp'
+
+  /**
+   * A run that reached a passing verification the documented way: scan, one patched
+   * cluster, `clone_verify` PASS. Every test below starts from exactly this state, so
+   * what it asserts is the difference the gate has to make.
+   */
+  async function verifiedRun(): Promise<{ root: string, ctx: Context, runner: ReturnType<typeof fakeRunner> }> {
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,${PATCHED_FILE},ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const runner = fakeRunner([
+      ['git checkout -B', { stdout: '' }],
+      // `clone_submit`'s branch guard must see the run's own branch; this answer also
+      // serves the baseline read, where the run's branch is derived from it.
+      ['git rev-parse --abbrev-ref HEAD', { stdout: 'clone-refactor/r1\n' }],
+      // First-match-wins, so these narrow reads precede GIT_OK's broad ones. The first
+      // answer is the baseline read (clean at start), the second the reconcile.
+      ['git status --porcelain', [{ stdout: '' }, { stdout: ` M ${PATCHED_FILE}\u0000` }]],
+      ['git diff --name-only -z abc123', [{ stdout: '' }, { stdout: `${PATCHED_FILE}\u0000` }]],
+      ...GIT_OK,
+      ['msbuild', { stdout: 'Build succeeded\n' }],
+      ['git add', {}],
+      ['git commit', {}],
+    ])
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true, maxClusters: 2 },
+      verify: STEPS,
+      submit: { mode: 'commit' },
+    }, runner)
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    const assessed = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'extracted the shared computation', files_changed: [PATCHED_FILE],
+      evidence: { file: PATCHED_FILE, line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    expect((assessed as { isError?: boolean }).isError, rendered(assessed)).not.toBe(true)
+    const verified = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((verified as { isError?: boolean }).isError, rendered(verified)).not.toBe(true)
+    await settle(ctx, 'r1')
+    return { root, ctx, runner }
+  }
+
+  it('commits exactly the ledger files after a passing verification', async () => {
+    // Acceptance 3: the legitimate flow still works end to end.
+    const { ctx, runner } = await verifiedRun()
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError, rendered(submitted)).not.toBe(true)
+    const payload = JSON.parse(rendered(submitted)) as { committed: boolean, mode: string }
+    expect(payload.committed).toBe(true)
+    expect(payload.mode).toBe('commit')
+    const outward = runner.calls.map(entry => entry.argv.join(' '))
+      .filter(line => line.startsWith('git add') || line.startsWith('git commit'))
+    expect(outward).toEqual([
+      `git add -- ${PATCHED_FILE}`,
+      // The commit is narrowed to the same paths: `git add` alone never bounded it.
+      `git commit --only -m clone refactor(r1): deduplicate 1 file(s) -- ${PATCHED_FILE}`,
+    ])
+  })
+
+  it('refuses a patch authorized AFTER the verification it would ride on', async () => {
+    // Acceptance 1, the reachable scenario: verify PASSES, then `clone_assess` widens
+    // the same cluster's authorization with replace: true. The gate was one run-level
+    // boolean read from one file, so this committed and pushed a file nobody built or
+    // tested while report.md still said verify_ok: true.
+    const { ctx, runner } = await verifiedRun()
+    const widened = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'the helper also touches b.cpp',
+      files_changed: [PATCHED_FILE, 'module/laws/src/b.cpp'],
+      evidence: { file: 'module/laws/src/b.cpp', line: 33, snippet: 'return area(r);' },
+      replace: true, confirm: true,
+    })
+    expect((widened as { isError?: boolean }).isError, rendered(widened)).not.toBe(true)
+
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError, rendered(submitted)).toBe(true)
+    // The refusal names the reason the operator has to act on, and the cluster.
+    expect(rendered(submitted)).toMatch(/authorized after the verification/)
+    expect(rendered(submitted)).toContain('C001')
+    expect(rendered(submitted)).toMatch(/clone_verify/)
+    expect(gitVerbsOf(runner)).not.toContain('commit')
+  })
+
+  it('refuses when the newest verification job did not succeed', async () => {
+    // Acceptance 2: attempt 1 recorded a passing result.json, but the newest verify
+    // JOB is the failed attempt 2 — the terminal job record is written on a separate
+    // path from result.json, so a gate that reads only result.json saw [attempt 1].
+    const { root, ctx, runner } = await verifiedRun()
+    const { runPaths, writeAtomic } = await import('../src/core/artifacts.ts')
+    const paths = runPaths(join(root, 'runs'), 'r1')
+    const failedJob = 'verify-20270101-000000-beef'
+    await writeAtomic(join(paths.dir, 'jobs', `${failedJob}.json`), `${JSON.stringify({
+      job_id: failedJob, run_id: 'r1', kind: 'verify', status: 'failed',
+      started_at: '2027-01-01T00:00:00.000Z', finished_at: '2027-01-01T00:01:00.000Z',
+      error: 'attempt 2: msbuild tests.sln failed', summary: '',
+    }, null, 2)}\n`)
+
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError, rendered(submitted)).toBe(true)
+    expect(rendered(submitted)).toMatch(/not succeeded/)
+    expect(rendered(submitted)).toContain(failedJob)
+    expect(gitVerbsOf(runner)).not.toContain('commit')
+  })
+
+  it('refuses a run whose attempt carries no record of what it verified', async () => {
+    // A run from before the record existed: its reconcile.json has no timestamp and
+    // no cluster set, so nothing can be established about WHEN this authorization was
+    // read. It must not become silently submittable.
+    const { root, ctx, runner } = await verifiedRun()
+    const { runPaths, writeAtomic } = await import('../src/core/artifacts.ts')
+    const paths = runPaths(join(root, 'runs'), 'r1')
+    await writeAtomic(join(paths.verifyDir, '1', 'reconcile.json'), `${JSON.stringify({
+      authorized: [PATCHED_FILE], changed: [PATCHED_FILE], unauthorized: [], missing: [],
+    }, null, 2)}\n`)
+
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError, rendered(submitted)).toBe(true)
+    expect(rendered(submitted)).toMatch(/no reconcile record/)
+    expect(gitVerbsOf(runner)).not.toContain('commit')
+  })
+
+  it('numbers the next attempt from the highest attempt directory', async () => {
+    // An attempt killed before its result.json write: `length + 1` reuses its number
+    // and overwrites its step logs and reconcile.json.
+    const { root, ctx } = await verifiedRun()
+    const { runPaths, writeAtomic } = await import('../src/core/artifacts.ts')
+    const paths = runPaths(join(root, 'runs'), 'r1')
+    await writeAtomic(join(paths.verifyDir, '2', '1-build.log'), 'attempt two, killed mid-build\n')
+
+    const verified = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((verified as { isError?: boolean }).isError, rendered(verified)).not.toBe(true)
+    expect((JSON.parse(rendered(verified)) as { attempt: number }).attempt).toBe(3)
+    await settle(ctx, 'r1')
+    // The killed attempt's evidence survived: it is not the next attempt's log file.
+    expect(await readFile(join(paths.verifyDir, '2', '1-build.log'), 'utf8'))
+      .toBe('attempt two, killed mid-build\n')
+  })
+})
+
+describe('a damaged verification record stays visible instead of fatal', () => {
+  const STEPS = { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] }
+  const PATCHED_FILE = 'module/laws/src/a.cpp'
+
+  /** The same passing run as above, so a later test can damage one record. */
+  async function verifiedRun(): Promise<{ root: string, ctx: Context }> {
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,${PATCHED_FILE},ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true },
+      verify: STEPS,
+    }, fakeRunner([
+      ['git checkout -B', { stdout: '' }],
+      ['git status --porcelain', [{ stdout: '' }, { stdout: ` M ${PATCHED_FILE}\u0000` }]],
+      ['git diff --name-only -z abc123', [{ stdout: '' }, { stdout: `${PATCHED_FILE}\u0000` }]],
+      ...GIT_OK,
+      ['msbuild', { stdout: 'Build succeeded\n' }],
+    ]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'extracted the shared computation', files_changed: [PATCHED_FILE],
+      evidence: { file: PATCHED_FILE, line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    await call(ctx, 'clone_verify', { run_id: 'r1' })
+    await settle(ctx, 'r1')
+    return { root, ctx }
+  }
+
+  it('polls and reports past a damaged result.json, naming the file', async () => {
+    // `readJson` throws on malformed JSON, and the sibling reader of durable records
+    // (`latestJob`) skips and names. Here the damaged file made clone_check — the only
+    // progress interface — clone_report and clone_submit's refusal all throw.
+    const { root, ctx } = await verifiedRun()
+    const { runPaths, writeAtomic } = await import('../src/core/artifacts.ts')
+    const paths = runPaths(join(root, 'runs'), 'r1')
+    await writeAtomic(join(paths.verifyDir, '1', 'result.json'), '{"attempt":\n')
+    await writeAtomic(join(paths.verifyDir, '2', 'result.json'), `${JSON.stringify({
+      attempt: 2, ok: true, started_at: '2026-09-20T02:00:00.000Z', finished_at: '2026-09-20T02:01:00.000Z',
+      steps: [], rolled_back: false, rollback_files: [],
+    }, null, 2)}\n`)
+
+    const status = await call(ctx, 'clone_check', { run_id: 'r1', what: 'status' })
+    expect((status as { isError?: boolean }).isError, rendered(status)).not.toBe(true)
+    const payload = JSON.parse(rendered(status)) as { unreadable_attempts: string[] }
+    // The good sibling is still readable, and the damaged file is named, not dropped.
+    expect(payload.unreadable_attempts).toEqual(['verify/1/result.json'])
+
+    // The intended refusal of `clone_submit` must be a refusal, not a JSON parse error.
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError).toBe(true)
+
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError, rendered(reported)).not.toBe(true)
+    const summary = (JSON.parse(rendered(reported)) as { summary: { unreadable_records: string[] } }).summary
+    expect(summary.unreadable_records).toContain('verify/1/result.json')
+  })
+
+  it('names an unreadable job record in the report instead of presenting an older job', async () => {
+    // `latestJob`'s visible-skip hook exists so a corrupt record is not dropped from
+    // the poll. `clone_report` called it without the hook, so a corrupt newest job
+    // record made the report silently present an older job as the run's last one.
+    const { root, ctx } = await verifiedRun()
+    const { runPaths } = await import('../src/core/artifacts.ts')
+    const paths = runPaths(join(root, 'runs'), 'r1')
+    const corrupt = 'verify-20270101-000000-cccc.json'
+    await writeFile(join(paths.dir, 'jobs', corrupt), '{"job_id":', 'utf8')
+
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError, rendered(reported)).not.toBe(true)
+    const summary = (JSON.parse(rendered(reported)) as { summary: { unreadable_records: string[] } }).summary
+    expect(summary.unreadable_records).toEqual([corrupt])
+    expect(await readFile(paths.reportMd, 'utf8')).toContain(corrupt)
+  })
+})
+
+describe('a resolved freeze is not reported as a freeze', () => {
+  it('reads the freeze claim from the attempt the submit gate reads', async () => {
+    // Attempt 1 found an unauthorized file (the run froze, correctly); the operator
+    // reverted it and attempt 2 reconciled clean, verified and submitted. The report
+    // printed the UNION of every attempt, so a finished run read as frozen.
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true },
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
+      submit: { mode: 'commit' },
+    }, fakeRunner([
+      ['git checkout -B', { stdout: '' }],
+      ['git rev-parse --abbrev-ref HEAD', { stdout: 'clone-refactor/r1\n' }],
+      // First-match-wins: the baseline read, then attempt 1's reconcile with the
+      // unauthorized file, then attempt 2's after the operator reverted it.
+      ['git status --porcelain', [
+        { stdout: '' },
+        { stdout: ' M module/laws/src/a.cpp\u0000 M module/laws/src/sneaky.cpp\u0000' },
+        { stdout: ' M module/laws/src/a.cpp\u0000' },
+      ]],
+      ['git diff --name-only -z abc123', [
+        { stdout: 'module/laws/src/a.cpp\u0000module/laws/src/sneaky.cpp\u0000' },
+        { stdout: 'module/laws/src/a.cpp\u0000' },
+      ]],
+      ...GIT_OK,
+      ['msbuild', { stdout: 'Build succeeded\n' }],
+      ['git add', {}],
+      ['git commit', {}],
+    ]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'extracted the shared computation', files_changed: ['module/laws/src/a.cpp'],
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+
+    const frozen = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((frozen as { isError?: boolean }).isError, rendered(frozen)).toBe(true)
+    expect(rendered(frozen)).toMatch(/UNAUTHORIZED_CHANGES/)
+
+    // The documented way out: the operator reverts the file, and verification passes.
+    const recovered = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((recovered as { isError?: boolean }).isError, rendered(recovered)).not.toBe(true)
+    await settle(ctx, 'r1')
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError, rendered(submitted)).not.toBe(true)
+
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError, rendered(reported)).not.toBe(true)
+    const summary = (JSON.parse(rendered(reported)) as {
+      summary: { unauthorized_files: string[], resolved_unauthorized_files: string[] }
+    }).summary
+    expect(summary.unauthorized_files).toEqual([])
+    // The history is kept, marked resolved: the earlier freeze stays auditable.
+    expect(summary.resolved_unauthorized_files).toEqual(['module/laws/src/sneaky.cpp'])
+    const report = await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')
+    expect(report).not.toContain('本 run 已冻结')
+    expect(report).not.toContain('## 未授权改动')
   })
 })

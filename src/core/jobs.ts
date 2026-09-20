@@ -85,21 +85,20 @@ export async function finishJob(
   return finished
 }
 
-/** The newest job of a run, by start time then id: what a poller reports. */
-export async function latestJob(
+/**
+ * Every readable job record of a run, oldest first. A `<id>.json` that cannot be
+ * read as a record is skipped and named.
+ */
+async function readJobs(
   paths: RunPaths,
-  /**
-   * Called for a `<id>.json` that could not be read as a job record, so a skip is
-   * visible rather than silent. A corrupt file is not dropped from the poll.
-   */
   onUnreadable?: (name: string, error: Error) => void,
-): Promise<JobRecord | undefined> {
+): Promise<JobRecord[]> {
   let names: string[]
   try {
     names = await readdir(join(paths.dir, 'jobs'))
   } catch (error) {
     // No job was ever recorded: the very first poll of a fresh run lands here.
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
     throw error
   }
   const jobs: JobRecord[] = []
@@ -122,10 +121,37 @@ export async function latestJob(
     }
     jobs.push(job)
   }
-  if (jobs.length === 0) return undefined
   return jobs.sort((left, right) => (left.started_at === right.started_at
     ? left.job_id.localeCompare(right.job_id)
-    : left.started_at.localeCompare(right.started_at))).at(-1)
+    : left.started_at.localeCompare(right.started_at)))
+}
+
+/** The newest job of a run, by start time then id: what a poller reports. */
+export async function latestJob(
+  paths: RunPaths,
+  /**
+   * Called for a `<id>.json` that could not be read as a job record, so a skip is
+   * visible rather than silent. A corrupt file is not dropped from the poll.
+   */
+  onUnreadable?: (name: string, error: Error) => void,
+): Promise<JobRecord | undefined> {
+  return (await readJobs(paths, onUnreadable)).at(-1)
+}
+
+/**
+ * The newest VERIFY job of a run: what `clone_submit` binds a verification to.
+ *
+ * The job record is the durable terminal status, written on a path of its own
+ * (`settle` → `finishJob`) and therefore independently of `result.json`. An attempt
+ * that failed a required step but could not write its result still leaves this
+ * record failed, and a submit gate that read only `result.json` saw the older,
+ * passing attempt and accepted it.
+ */
+export async function latestVerifyJob(
+  paths: RunPaths,
+  onUnreadable?: (name: string, error: Error) => void,
+): Promise<JobRecord | undefined> {
+  return (await readJobs(paths, onUnreadable)).filter(job => job.kind === 'verify').at(-1)
 }
 
 /** The shape a job record must have for the sort above to be well defined. */
