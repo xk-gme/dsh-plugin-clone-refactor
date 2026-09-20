@@ -4001,22 +4001,28 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
     async execute(args) {
       const runId = requireText(args.run_id, 'run_id')
       const clusterId = requireText(args.cluster_id, 'cluster_id')
-      const { paths } = await openRun({ settings, runner, artifactsRoot, runId })
+      const { paths, record } = await openRun({ settings, runner, artifactsRoot, runId })
       const clusters = await loadJsonlClusters(paths)
       knownCluster(clusters.map(cluster => cluster.id), clusterId)
       const reason = requireText(args.reason, 'reason')
       const files = (args.files_changed ?? []).map(normalizeRepoPath).filter(Boolean)
       if (args.verdict === 'patched') {
         if (args.confirm !== true) throw new Error('Recording a patched verdict needs confirm: true — source changes are the user\'s decision, not the model\'s.')
-        if (!settings.authorization.enabled) throw new Error('Patching is disabled: set authorization.enabled: true in the profile row before any run may change source.')
-        if (PRIORITY_RANK[args.priority] < PRIORITY_RANK[settings.authorization.maxPriority]) {
-          throw new Error(`authorization.maxPriority is ${settings.authorization.maxPriority}, so a ${args.priority} cluster may not be patched in this deployment.`)
+        // 授权读的是 run 自己的配置快照，不是实时 settings（R28）。"这个 run 能不能改源码、
+        // 最高到哪个优先级、最多几个簇"是用户在**建 run 时**做出的同意决定；允许它在 run
+        // 存活期间被一次 profile 编辑翻转，正是快照存在的意义。而 verify.steps 与
+        // reportLanguage 属于操作者工具链，继续读实时 settings —— 修好一个坏掉的构建命令
+        // 不该逼人放弃整个 run。
+        const authorization = record.settings.authorization
+        if (!authorization.enabled) throw new Error('Patching is disabled: set authorization.enabled: true in the profile row before any run may change source.')
+        if (PRIORITY_RANK[args.priority] < PRIORITY_RANK[authorization.maxPriority]) {
+          throw new Error(`authorization.maxPriority is ${authorization.maxPriority}, so a ${args.priority} cluster may not be patched in this deployment.`)
         }
         if (files.length === 0) throw new Error('A patched verdict needs files_changed: the authorization ledger is what clone_verify reconciles against.')
         if (args.evidence === undefined) throw new Error('A patched verdict needs evidence: the file, line and snippet of the change.')
         const patches = await loadPatches(paths)
-        if (!patches.some(patch => patch.cluster_id === clusterId) && patches.length >= settings.authorization.maxClusters) {
-          throw new Error(`authorization.maxClusters is ${settings.authorization.maxClusters}; this run already patched ${patches.length} cluster(s).`)
+        if (!patches.some(patch => patch.cluster_id === clusterId) && patches.length >= authorization.maxClusters) {
+          throw new Error(`authorization.maxClusters is ${authorization.maxClusters}; this run already patched ${patches.length} cluster(s).`)
         }
       } else if (args.priority === 'P0' && args.evidence === undefined) {
         throw new Error('A P0 verdict that is not patched needs evidence of the concrete blocker (file, line, snippet). "Semantics unclear" is not evidence.')
@@ -4074,7 +4080,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         // 未提交的工作：对被跟踪文件执行 `git restore --source=HEAD` 会抹掉他开跑前的
         // 改动，对未跟踪文件执行 `git clean` 会删掉他开跑前就存在的文件。此时只记录
         // 失败、把工作区原样留给他处理（`rolled_back: false` 会出现在报告里）。
-        if (!result.ok && !settings.verify.keepFailedPatch && authorized.length > 0 && record.baseline.dirty.length === 0) {
+        if (!result.ok && !record.settings.verify.keepFailedPatch && authorized.length > 0 && record.baseline.dirty.length === 0) {
           await checkoutFiles(runner, record.project_root, authorized)
           result.rolled_back = true
           result.rollback_files = authorized
