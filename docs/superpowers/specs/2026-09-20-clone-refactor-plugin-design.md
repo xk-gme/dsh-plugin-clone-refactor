@@ -324,7 +324,12 @@ verify:
 | 降级测试 | 空配置 / 非法配置下的挂载行为 |
 | 结构分簇 | 固定 CSV 夹具：四组列别名的解析、路径归一化、连通分量划分、代表对选取、3000 字符截断 |
 
-`pnpm run verify` = typecheck + build + tests。
+`pnpm run verify` = typecheck + build + tests + 打包冒烟。
+
+> **as-built 补记（Task 14 落地后回填，2026-09-20）：** 本节原先只写 `typecheck + build + tests`，而实现里 `verify` 还串了 `test:pack`（`node tests/pack-smoke.mjs`）。这不是代码跑偏，是本节漏了一条**本该先写下来**的要求：插件是发布物，`files` 清单漏掉 `cordis.patch.yml` 会让市场安装"装上了但什么都没发生"，而只跑单测发现不了这一点。因此这里补两条要求，并保留"补记"标记，而不是把它悄悄改写成一直如此（R41/R43 的教训）：
+>
+> - `verify` 必须包含对**打包产物**的检查：`lib/index.js`、`cordis.patch.yml`、`LICENSE` 必须在 `npm pack` 的清单里，`docs/superpowers/` 必须不在其中，且 `dsh.bundle.patch` 指向已提交的 patch 层。
+> - 打包冒烟只能证明**清单**正确；入口能否加载是另一回事（23 字节的 `lib/index.js` 也能通过清单检查）。入口可加载性由 Task 14 的修复轮补上。
 
 ---
 

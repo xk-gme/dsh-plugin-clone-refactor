@@ -5009,8 +5009,12 @@ git commit -m "test: pin the install contract, the whole chain and the packaged 
 ### Task 15: 使用文档与发布准备
 
 **Files:**
-- Create: `README.md`, `README.zh.md`, `docs/setup.md`, `docs/setup.zh.md`
-- Modify: `src/verify/engine.ts`（若 Task 9 的注释与实际代码不一致，以此任务为准做最后核对）
+- Create: `README.md`, `README.zh.md`, `docs/setup.md`, `docs/setup.zh.md`, `tests/docs.spec.ts`
+- Modify: `src/index.ts`（`guidanceText`：补 R50 的撤回语义，并改正"job 停在 `running` 就是被中断"这句可能不成立的话）
+- Modify: `src/report/report.ts`、`src/core/jobs.ts`、`src/core/ledger.ts`（**只改那几句话/那几段 docblock**："停在 `running` 就是被中断"在 R51 之后不再成立 —— 终态写盘失败时任务可能是**成功**的；`ledger.ts:9` 还在警告"`writeAtomic` 的固定 `<file>.tmp` 名"，而 R51 恰恰把固定名换成了每次调用唯一的名字，所以这句是**反方向**的假话。改成同时说出两种成因，并说清失败在哪里被报告；**先读 R51 提交后的实际代码再写，不许猜**）
+- Modify: `src/verify/engine.ts`、`src/git/baseline.ts`（**只改注释措辞**：注释里还留着计划内部编号 "Task 13"/"Task 6"，改成真实函数名；**逻辑一行都不许动**）
+
+**House style:** 同族的 `D:\workspace\gme-dsh-plugin\dsh-gme-defect-scan` 已经是同一形状（`README.md` / `README.zh.md` / `docs/setup.md` / `docs/setup.zh.md`，且它的 `package.json` 的 `files` 与本包逐字相同）。**先读它的 README 与 `docs/setup.md`，照它的分节顺序与深度写**（`# 标题` → `## Tools` → `## Install` → `## Configure` → … → `## Development` → `## License`），不要另创一套结构；"中英内容等价"的判定标准也照它。
 
 **Interfaces:**
 - Consumes: 全部
@@ -5024,8 +5028,8 @@ git commit -m "test: pin the install contract, the whole chain and the packaged 
 # dsh-gme-clone-refactor
 
 A GME clone-detection-and-refactor workflow inside DeepSeek Harness: scan the clone
-families of one module, judge each one, apply at most one authorized minimal patch,
-verify it with a real build and test, and submit only what passed. It never guesses:
+families of one module, judge each one, apply an authorized minimal patch, verify it
+with a real build and test, and submit only what passed. It never guesses:
 an unverified patch cannot be submitted, and a changed file the user never
 authorized freezes the run.
 
@@ -5045,12 +5049,26 @@ Community plugin, not an official DeepSeek package.
 ## Install
 
 ```sh
-dsh plugin --profile web add dsh-gme-clone-refactor
+node $dsh plugin --profile <profile> add dsh-gme-clone-refactor
+```
+
+Then confirm the row actually mounted, with its `!!js` expressions left unevaluated:
+
+```sh
+node $dsh --profile <profile> --dump-config
 ```
 
 ## Configure
 
-...（环境变量表 + profile patch 示例 + 配置键表）
+Two environment variables, both optional:
+
+| Variable | Meaning |
+|---|---|
+| `GME_CLONE_REFACTOR_ROOT` | Absolute path to the GME work tree this plugin may patch. Unset means the plugin registers no tools at all (that is the boot hazard the install test pins). |
+| `GME_CLONE_REFACTOR_ARTIFACTS` | Run directory; defaults to `$DSH_HOME/gme-clone-refactor/runs`. |
+
+Everything else is configured in the profile row. The complete key table (with defaults)
+and a worked GME profile example are in [`docs/setup.md`](docs/setup.md).
 
 ## Two detection providers
 
@@ -5059,6 +5077,15 @@ but Harness. `detection.provider: python-pipeline` drives the existing
 `run_gme_clone_detection.py` and is the only path to type 3-4 (embedding) clones; it
 needs a Python checkout with libclang and, for type 3-4, an embeddings endpoint.
 **The two never produce comparable cluster sets, so every report records which one ran.**
+
+Type 3-4 also needs the **commercial** embedding channel selected: setting
+`detection.embeddingApiBase` (and `detection.embeddingApiKey` if your endpoint wants one)
+is what selects it. Leaving both unset keeps the pipeline on its own local channel, where
+no key is used at all — a key configured for a run that never selects commercial is a key
+carried on a command line for nothing. Before sending a run directory anywhere, read the
+credential-exposure note in [`docs/setup.md`](docs/setup.md): the key travels as a command
+line argument, so a pipeline that echoes its own argv can leave it in the host's spill file
+as well as in the plugin's (redacted) log.
 
 ## What this plugin does NOT do
 
@@ -5075,18 +5102,43 @@ needs a Python checkout with libclang and, for type 3-4, an embeddings endpoint.
 - Scanning and verification occupy the work tree: do not switch branches or run your
   own build there while a job is running.
 - Aborting a tool call stops waiting; it does not cancel the command. A job left at
-  `running` was interrupted, and the report says so.
+  `running` has **no terminal record**: either the run was interrupted, or the record
+  could not be written. Neither is a success, and the report names which job it was.
 - `submit.mode` defaults to `none`, and `authorization.enabled` defaults to off.
+- Patching is per-cluster and minimal. At most `authorization.maxClusters` clusters
+  (default 1) may hold **live** authorization at a time — that is a cap on currently
+  authorized clusters, not a count of patches over the run's life: retracting a verdict
+  frees its slot.
+
+## Development
+
+```sh
+pnpm install
+pnpm run verify     # typecheck && build && vitest && the packaged-artefact smoke test
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 ````
+
+**写 README 时的三条硬约束（模板只给结构与措辞，内容是你要写实的）：**
+
+1. **`$dsh` 的拼法照既有流程**：它指 `apps/cli/lib/bin.js`，写法以 `D:\workspace\gme-dsh-plugin\README.md` 为准（`node $dsh plugin --profile <p> add <pkg>@<ver>`），不要另造一个 `dsh plugin …` 拼法。
+2. **模板里不许留 `...`**：README 里出现 `...` 就是缺陷。`Configure` 一节按模板给的两样写实（环境变量表 + 指向 `docs/setup.md` 的完整键表与 profile 示例）。
+3. **模板里不许出现计划内部的话**：`README.md` 是英文正式文档，模板外的中文说明（本段、`House style` 那段）都属于计划，不得抄进 README；`README.zh.md` 是它的中文对应版，不是计划文本的搬运。
 
 - [ ] **Step 2: 写配置参考 `docs/setup.md` / `docs/setup.zh.md`**
 
-至少覆盖：环境变量与 profile patch 两种配置方式、§12 的完整配置键表、一份**完整的 GME profile 示例**（`verify.steps` 的 build/test/format/restore 取值）、首次自用的一次实测清单（见下）、以及 troubleshooting 表（`detection.scriptPath` 未配置、验证步骤为空、工作区不干净、run 停在 running、UNAUTHORIZED_CHANGES 的含义）。
+至少覆盖：环境变量与 profile patch 两种配置方式、§12 的完整配置键表、一份**完整的 GME profile 示例**（`verify.steps` 的 build/test/format/restore 取值）、首次自用的一次实测清单（见下）、以及 troubleshooting 表（`detection.scriptPath` 未配置、验证步骤为空、工作区不干净、run 停在 running、UNAUTHORIZED_CHANGES 的含义）。troubleshooting 表里还必须有这两行，它们都是"配置看起来配了、其实没生效"的典型：
 
-另有两项**必须**写进使用文档，它们是设计里明确的边界而不是待办：
+- **类型 3-4 一个都没找到，或者 key 配了却毫无作用** → `detection.embeddingApiBase`（需要 key 时再加 `detection.embeddingApiKey`）才是**选中 commercial 通道**的开关；两个都空着时管线走它自己的 local 通道，这时 key 只会白白躺在命令行上（R32）。
+- **`authorization.maxPriority` 是"允许的最高严重度"，不是"我要重构这些"**：`P0` 只放 P0，`P1` 放 P0–P1，`PX` 放开一切 —— 而 §8 明确说 PX 簇**任何时候都不该被重构**，所以把它写成"允许一切"时必须同时写清这一句（R48）。
+
+另有一组**必须**写进使用文档的条目，它们是设计里明确的边界而不是待办：
 
 - **运行范围**：`projectRoot` 必须是跟踪本次目标文件的**那个** git 仓库。目标在子模块内（如 `module/laws/**`）时指向该子模块本身；跨 superproject + submodule 的单次运行不在本期范围。写清"为什么"：主工程的 `git ls-files` / `status` / `diff` 看不到子模块内的文件，会直接导致授权对账判为未授权、分区回滚误判为"本次新建"。
-- **凭据暴露面（R34）**：embedding key 是**以命令行参数**传给检测脚本的（脚本只认 `--embedding-commercial-api-key`，且命令执行接口不传环境变量）。因此一个会回显自身 argv 的管线可能把 key 写到比插件所控制的更广的地方：插件的 run 日志已脱敏，但**宿主在输出被截断时落盘的 spill 文件**在 run 目录之外，插件既读不到也脱不了敏。文档要如实写明这条**残留暴露面**，让操作者据此判断 run 目录与其周边产物能否外发。
+- **凭据暴露面（R34，已按"key 不再进 run.json"的修复更新）**：embedding key **以命令行参数**传给检测脚本（脚本只认 `--embedding-commercial-api-key`，且命令执行接口不传环境变量）。**先说清已经安全的那一半**：插件自己持久化的 `run.json` 快照**不再包含 key** —— 它在唯一的"记录变字节"的边界上被替换为 `[redacted]`（`src/core/run.ts` 的 `serializeRun`，`openRun` 与 `saveRun` 共用），所以"复制/发布 run 目录"这件事本身不再泄漏 key；模型侧也没有通道，没有任何工具返回 `record` 或 `settings`。**再说清残留的那一半**：命令行的 argv 仍带着 key，因此一个会回显自身 argv 的管线可能把它写到插件控制范围之外 —— 插件的 run 日志已脱敏，但**宿主在输出被截断时落盘的 spill 文件**在 run 目录之外，插件既读不到也脱不了敏。文档要如实写明这条**残留暴露面**，让操作者据此判断 run 目录与其周边产物能否外发。**不要写成"key 不会落盘"**：它不落在 run 目录里，但一定在命令行上。
 - **回滚语义**：验证失败且 `verify.keepFailedPatch` 为假、**且基线干净**时，插件分区回滚 —— 被跟踪的文件恢复到基线，**本次新建的文件会被删除**；任一步失败会抛错并体现在 job 记录与报告中，不会出现"报告说回滚了、实际没回滚"。**开了 `workdir.allowDirty: true` 时不自动回滚**：操作者手上本来就有未提交的工作，恢复或删除都会毁掉它；此时只记录失败并把工作区原样留给他处理。
 - **撤回授权之后怎么出去（R49 的直接后果，任务 13 的 review 修正了两处措辞）**：把一个已 patch 的簇改判为 `report_only`/`skipped` 会**撤回**它的授权（`patches.json` 里那条记录被删除），但工作树里那个文件**仍然是改过的**，所以 `clone_verify` 会（正确地）判它未授权并**冻结整个 run**。出冻结有**两条**路，文档两条都要写：**① 操作者手动还原该文件**（`git restore --source=HEAD -- <file>`）；**② 用 `replace: true` + `confirm: true` 把这个簇重新判回 `patched`**（重新授权）。插件**不会**自动还原 —— 在用户说了"不要这个 patch"之后再去改他的代码，正是 R27 要避免的那类行为。（"只有一条出路"是错的，别照抄。）
 - **`guidanceText` 也必须说这件事。** 目前唯一的用户可见文案就是它（`src/index.ts`），所以它至少要说清：撤回授权**不等于**撤销补丁；run 会**停在 `clone_verify` 的冻结状态**，直到文件被还原或该簇被重新授权；以及**没有任何东西会自动还原**。模型看得到这条才可能在用户卡住时给出正确解释。
@@ -5101,32 +5153,34 @@ needs a Python checkout with libclang and, for type 3-4, an embeddings endpoint.
 
 - [ ] **Step 3: 核对实现与文档的一致性**
 
-先把打包冒烟扩到双语 README（它们现在才存在），`tests/pack-smoke.mjs` 里的必需文件列表改成：
+先把打包冒烟扩到双语 README 与 `docs/setup*.md`（它们现在才存在），`tests/pack-smoke.mjs` 里的必需文件列表改成：
 
 ```js
-for (const required of ['lib/index.js', 'cordis.patch.yml', 'LICENSE', 'README.md', 'README.zh.md']) {
+for (const required of ['lib/index.js', 'cordis.patch.yml', 'LICENSE', 'README.md', 'README.zh.md', 'docs/setup.md', 'docs/setup.zh.md']) {
 ```
+
+**第 3 步的验收不能只是"人工逐项确认"** —— 人工比对没有第二次机会，文档一漂移就没人再看。新建 `tests/docs.spec.ts` 把可机械化的两条固定下来（这就是 R38 那条纪律在文档上的用法：断言必须能因为一个**具体**的错而变红）：
+
+- **工具表**：断言六个工具名在 `README.md` 与 `README.zh.md` 里都出现，**并且**两份 README 里不出现任何其它 `clone_*` 工具名（防止文档写了并不存在的工具，或漏了一个）。六个名字必须来自真正注册的那份清单（`src/tools.ts` 的注册表），不是在测试里再抄一遍字符串。
+- **配置键表**：`resolveSettings({})` 的**每一个叶子键路径**（如 `detection.provider`、`authorization.maxClusters`、`workdir.allowDirty`）都必须出现在 `docs/setup.md` 里。确实不该写进用户文档的键，必须在测试里用一张**带理由**的豁免表列出；**不许靠删断言来让它变绿**。
+- `package.json` 的 `files` 仍包含 `lib`/`cordis.patch.yml`/`docs`/两个 README/`LICENSE`，且排除 `docs/superpowers`（前半由 pack-smoke 覆盖，`!docs/superpowers` 的断言必须保留）。
+- `docs/setup.md` 与 `docs/setup.zh.md` 的**内容等价**无法自动断言，仍由人工逐条核对 —— 报告里要写清核对方式（逐节对照还是逐表对照），不要只写"已确认"。
 
 然后 Run: `pnpm run verify`
 Expected: 退出码 0
 
-逐项确认（这就是本任务的验收）：
-
-- `package.json` 的 `files` 包含 `lib`、`cordis.patch.yml`、`docs`、`README.md`、`README.zh.md`、`LICENSE`，且排除 `docs/superpowers`。
-- README 的工具表与 `src/tools.ts` 注册的六个名字逐字一致。
-- 配置键表与 `src/config.ts` 的 `Settings` 逐字段一致（含默认值）。
-- `docs/setup.md` 与 `docs/setup.zh.md` 内容等价。
-
 - [ ] **Step 4: 提交**
 
 ```bash
-git add -A
+git add -- README.md README.zh.md docs/setup.md docs/setup.zh.md tests/docs.spec.ts tests/pack-smoke.mjs src/index.ts src/report/report.ts src/core/jobs.ts src/verify/engine.ts src/git/baseline.ts
 git commit -m "docs: document installation, configuration, the two detection providers and the limits"
 ```
 
+**不要 `git add -A`**（R44，硬规定）：controller 的工作区里可能带着未提交的计划编辑，全仓 `add` 会把它扫进你的任务提交，污染本任务的 review package。只 `add` 本步实际改过的路径。
+
 - [ ] **Step 5: 发布准备（只准备，不执行）**
 
-按 `D:\workspace\gme-dsh-plugin\README.md` 的既有流程，创建远端仓库并打标签，**真正的 `npm publish` 与市场收录 PR 留给你确认后执行**：
+按 `D:\workspace\gme-dsh-plugin\README.md` 的既有流程把命令写出来、把清单核对好，但**不执行任何对外动作**：不 `git remote add`、不 `git push`、不建远端仓库、不 `npm publish`、不动市场收录 PR。现在 `git remote -v` 是**空的**，所以"推到 origin"这一步根本无从发生，写进文档/报告即可。把这份清单连同 `npm pack --dry-run` 的**真实文件列表**写进你的报告，由 controller 交给用户确认后再执行：
 
 ```bash
 git remote add origin git@github.com:nuaaweixinye/dsh-gme-clone-refactor.git
@@ -5162,7 +5216,7 @@ npm pack --dry-run           # 确认清单后再考虑 npm publish
 
 **2. 占位符扫描**
 
-已扫过：本计划不含 TBD/TODO/"稍后实现"/"类似 Task N"。文档任务（Task 15）里 README 用 `...` 标出的是**待写散文的章节结构**，不是待实现的代码；配置键表、实测清单与验收项都已列明。
+已扫过：本计划不含 TBD/TODO/"稍后实现"/"类似 Task N"。文档任务（Task 15）里 README 原先用 `...` 标出的 `Configure` 一节**已在本轮预检中改成可发布的真实内容**——README 里出现 `...` 就是缺陷，不是章节标记；配置键表、实测清单与验收项都已列明。
 
 **3. 类型与命名一致性**
 
@@ -5176,6 +5230,18 @@ npm pack --dry-run           # 确认清单后再考虑 npm publish
 - `tools.ts` 的导入表去掉了 `readBaseline` / `readJson` / `track` / `VerifyResult` 等未使用项，补上 `detach` / `startJob` / `loadUnauthorized` / `loadVerifyAttempts` / `readNewestVerifyLog`。
 - `verify/artifacts.ts` 补上 `readFile` 导入（`readNewestVerifyLog` 需要）。
 - `engine.ts` 重复的 `if (!ok && step.required) failed = true` → 合并为一处。
+- **Task 15 派发前的预检（2026-09-20 晚，全部来自"后一个任务的清单是全流程最少被审的产物"这条教训）：**
+  - 它的 brief 是在 R50 落地**前 1 分 49 秒**抽取的（`task-15-brief.md` 12:49:35，R50 的 `5aeb4cf` 12:51:24），所以那份 brief 缺了 R50 的 `guidanceText` 要求，也仍然带着"撤回授权后的**唯一**出路"这句已经被 review 判定为**过头**的话。→ 计划改完后**重新抽取 brief**，不再手改 brief。
+  - 计划的 Files 只允许改 `src/verify/engine.ts`，而 5092 行却要求改 `src/index.ts` 的 `guidanceText`：**计划自相矛盾**。→ Files 补上 `src/index.ts`（R50 的撤回语义 + 改正"job 停在 `running` 就是被中断"这句可能不成立的话），并把注释里残留的计划内部编号 "Task 13"（`engine.ts:105`）与 "Task 6"（`baseline.ts:54`）一并收尾：**只改措辞，逻辑一行不动**。
+  - Step 4 的 `git add -A` 与 R44 直接冲突（R44 是硬规定）。→ 改成显式路径。
+  - Step 5 的 `git remote add` + `git push` 是**对外动作**，而 step 名自称"只准备，不执行"：自相矛盾，且当时 `git remote -v` 为空。→ 明确只准备、不执行，命令清单交给用户确认。
+  - pack-smoke 的必需文件列表漏了 `docs/setup.md` / `docs/setup.zh.md`（`files` 里 `docs` 是发布的），等于冒烟测试不检查本任务最主要的产物。→ 补上。
+  - README 开头的 "apply at most one authorized minimal patch" 正是 R50 点名不许写的那种说法（`maxClusters` 数的是**当前有效授权**，撤回会腾出名额）。→ 改成"an authorized minimal patch"，并在 Limits 里把这条语义写清。
+  - README 的 `Install` 一节写了 `dsh plugin --profile web add …`，而本仓库既有流程是 `node $dsh plugin --profile <p> add <pkg>@<ver>` + `--dump-config` 验证。→ 按既有拼法改写，并要求写上验证步骤。
+  - README 的 provider 一节没提 **commercial embedding 通道怎么选**（R32），也没把 R34 的暴露面指出来。→ 补一段，把 R32/R34 串起来。
+  - Step 3 原本只是"人工逐项确认"：人工比对没有第二次机会。→ 新增 `tests/docs.spec.ts`，把工具表（六个名字，且没有多余 `clone_*`）与配置键表（`resolveSettings({})` 的每个叶子键路径都出现在 `docs/setup.md`，不该写的键要带理由豁免）变成会变红的断言。
+  - README 少了两节同族插件都有的内容（`## Development`、`## License`）。→ 补进模板，并把"照着 `dsh-gme-defect-scan` 的分节顺序与深度写"写成硬要求：同族四个文档同名同形，读者才不用在两套结构之间切换。
+  - **R51 让包里四句话变成了假话**（这是本任务新增的、由别的 ruling 产生的收尾项）：`src/index.ts:68` 的 "A job stuck at running was interrupted, not successful"、`src/report/report.ts:225` 的 "停在 running 说明任务被中断，不是成功"、`src/core/jobs.ts:4` 的同义 docblock，以及 **`src/core/ledger.ts:9`** —— 最后这条是 R51 的复审者额外找出来的：它还在警告"`writeAtomic` 的固定 `<file>.tmp` 名"，而 R51 正是把固定名改成了每次调用唯一的名字，所以这句话**方向反了**（原来担心的事已经不可能发生，真正该说的是"没有共享 temp 名了"）。R51 之后，终态写盘失败时任务**可能已经成功**，记录却仍停在 `running`（R51 自己的新测试就分别覆盖了"任务失败"与"任务成功"两种留 `running` 的情形）。→ 四处都要改成同时说出两种成因、并指明失败在哪里被报告（目前只有 `ctx.logger.warn`，**模型看不到** —— 所以文档还要告诉操作者去 Harness 日志里看，不能只依赖 `clone_check` 的 `status`）；**先读 R51 提交后的代码再写**，因为这些句子必须与实现的真实行为一致，而不是与我的推测一致。
 
 **4. 与 spec 的已记录偏离**
 
