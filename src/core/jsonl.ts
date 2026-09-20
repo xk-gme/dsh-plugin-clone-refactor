@@ -9,10 +9,22 @@ export interface JsonlRead<T> {
   droppedLines: number[]
 }
 
-/** Append one record as its own line, creating the file's directory. */
+/**
+ * Append one record as its own line, creating the file's directory.
+ *
+ * `JSON.stringify(undefined)` is `undefined`, not a string, so the template below
+ * used to write the literal line `undefined` — a durable line no reader can consume,
+ * which `readJsonl` then reports as torn. Refusing is the only outcome that keeps
+ * every line in the file a JSON record: writing `null` instead would invent a record
+ * (a null assessment) that downstream callers would have to learn to distrust.
+ */
 export async function appendJsonl(file: string, value: unknown): Promise<void> {
+  const line = JSON.stringify(value)
+  if (line === undefined) {
+    throw new Error(`Cannot append a value that does not serialize to JSON: ${file}`)
+  }
   await ensureDir(dirname(file))
-  await appendFile(file, `${JSON.stringify(value)}\n`, 'utf8')
+  await appendFile(file, `${line}\n`, 'utf8')
 }
 
 /** Read a JSONL file: blank lines are skipped, malformed lines are reported and dropped. */

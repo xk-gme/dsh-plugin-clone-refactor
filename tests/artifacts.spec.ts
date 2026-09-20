@@ -72,7 +72,10 @@ describe('atomic writes and JSONL', () => {
     const file = join(root, 'nested', 'run.json')
     await writeAtomic(file, '{"a":1}')
     expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ a: 1 })
-    await expect(readFile(`${file}.tmp`, 'utf8')).rejects.toThrow()
+    // The temp name is `${file}.${pid}.${n}.tmp`, so reading a fixed `<file>.tmp`
+    // could never fail and pinned nothing. The listing is the assertion that can:
+    // the target is the only file the write left behind.
+    expect(await readdir(join(root, 'nested'))).toEqual(['run.json'])
   })
 
   it('reads a missing JSON file as undefined and rejects malformed JSON', async () => {
@@ -95,6 +98,19 @@ describe('atomic writes and JSONL', () => {
     const torn = await readJsonl<{ id: string }>(file)
     expect(torn.records.map(item => item.id)).toEqual(['C001', 'C003'])
     expect(torn.droppedLines).toEqual([2])
+  })
+
+  it('refuses a value that does not serialize instead of writing the line "undefined"', async () => {
+    const root = await tempRoot()
+    const file = join(root, 'assessments.jsonl')
+    await appendJsonl(file, { id: 'C001' })
+    // `JSON.stringify(undefined)` is `undefined`, not a string, so the old template
+    // wrote the literal line `undefined`: a durable record no reader can consume.
+    await expect(appendJsonl(file, undefined)).rejects.toThrow(/serialize/)
+    expect(await readFile(file, 'utf8')).toBe('{"id":"C001"}\n')
+    const read = await readJsonl<{ id: string }>(file)
+    expect(read.records.map(item => item.id)).toEqual(['C001'])
+    expect(read.droppedLines).toEqual([])
   })
 
   it('writes concurrently to one target without leaving a temp file behind', async () => {
@@ -144,13 +160,19 @@ describe('renameWithRetry', () => {
   })
 
   it('throws the original error when the transient failures never clear', async () => {
-    const always = flakyRename(Number.POSITIVE_INFINITY, 'EPERM')
+    // One stable error instance across every attempt: the caller must see the error
+    // the rename actually raised, not a look-alike carrying the same `.code`.
+    const original = Object.assign(new Error('EPERM: the same rename error every attempt'), { code: 'EPERM' })
+    let calls = 0
+    const always = async (): Promise<void> => { calls += 1; throw original }
     const sleeps: number[] = []
-    await expect(renameWithRetry('from', 'to', always.rename, async ms => { sleeps.push(ms) }))
-      .rejects.toMatchObject({ code: 'EPERM' })
-    expect(always.calls).toBe(10)
+    const caught = await renameWithRetry('from', 'to', always, async ms => { sleeps.push(ms) })
+      .then(() => undefined, (error: unknown) => error)
+    expect(caught).toBe(original)
+    expect((caught as NodeJS.ErrnoException).code).toBe('EPERM')
+    expect(calls).toBe(10)
     // 5 + 10 + 20 + 40 + 80 + 160 + 320 + 320 + 320: capped, bounded, still brief.
-    expect(sleeps).toHaveLength(always.calls - 1)
+    expect(sleeps).toHaveLength(calls - 1)
     expect(sleeps.at(-1)).toBe(320)
     expect(sleeps.reduce((total, ms) => total + ms, 0)).toBeLessThanOrEqual(1300)
   })

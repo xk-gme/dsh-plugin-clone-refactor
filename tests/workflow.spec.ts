@@ -51,8 +51,12 @@ const CSV_HEADER = 'pair_id,file1,func1_name,lines1,file2,func2_name,lines2,simi
 const GIT_OK: Array<[string, { stdout?: string }]> = [
   ['git rev-parse HEAD', { stdout: 'abc123\n' }],
   ['git rev-parse --abbrev-ref HEAD', { stdout: 'main\n' }],
+  // `git status --porcelain -z` / `git diff --name-only -z <head>`: the fake runner
+  // matches on the argv prefix, so these broad keys still answer the `-z` argv the
+  // production code now sends. Their stdout is NUL-separated, which is the form the
+  // parsers read.
   ['git status --porcelain', { stdout: '' }],
-  ['git diff --name-only', { stdout: 'module/laws/src/a.cpp\n' }],
+  ['git diff --name-only', { stdout: 'module/laws/src/a.cpp\u0000' }],
   // Reached only when authorization.enabled: `openRun` switches the run onto its
   // own branch before anything may patch source.
   ['git checkout -B', { stdout: '' }],
@@ -127,14 +131,15 @@ function gitVerbsOf(runner: ReturnType<typeof fakeRunner>): string[] {
  */
 const CLEAN_THEN_PATCHED: FakeScriptEntry = ['git status --porcelain', [
   { stdout: '' },
-  { stdout: ' M module/laws/src/a.cpp\n' },
+  { stdout: ' M module/laws/src/a.cpp\u0000' },
 ]]
 
 /** The tracked file the rollback would restore, plus the two rollback verbs. */
 const ROLLBACK_CALLS: FakeScriptEntry[] = [
-  ['git restore', { exitCode: 0 }],
-  ['git ls-files', { stdout: 'module/laws/src/a.cpp\u0000' }],
-  ['git clean', { exitCode: 0 }],
+  // `--literal-pathspecs` is a git-level option, so it precedes the subcommand.
+  ['git --literal-pathspecs restore', { exitCode: 0 }],
+  ['git --literal-pathspecs ls-files', { stdout: 'module/laws/src/a.cpp\u0000' }],
+  ['git --literal-pathspecs clean', { exitCode: 0 }],
 ]
 
 describe('clone_assess authorization rules', () => {
@@ -227,11 +232,11 @@ describe('clone_assess authorization rules', () => {
       // the reconcile, which is the state a widened patch really produces.
       ['git status --porcelain', [
         { stdout: '' },
-        { stdout: ' M module/laws/src/a.cpp\n M module/laws/src/b.cpp\n' },
+        { stdout: ' M module/laws/src/a.cpp\u0000 M module/laws/src/b.cpp\u0000' },
       ]],
-      ['git diff --name-only abc123', [
+      ['git diff --name-only -z abc123', [
         { stdout: '' },
-        { stdout: 'module/laws/src/a.cpp\nmodule/laws/src/b.cpp\n' },
+        { stdout: 'module/laws/src/a.cpp\u0000module/laws/src/b.cpp\u0000' },
       ]],
       ...GIT_OK,
     ]))
@@ -394,6 +399,29 @@ describe('clone_check', () => {
     // Explicitly null: an absent key would read as "the field was lost".
     expect(logged.log).toBeNull()
   })
+
+  it('keeps polling when one job record is corrupt', async () => {
+    // Disk damage or tampering is enough: one `<id>.json` that is not JSON used to
+    // reject every `clone_check` status, so the run became unobservable — and
+    // `clone_check` is the only progress interface the plugin's guidance has.
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,a.cpp,f,1-2,b.cpp,g,3-4,0.9,type12\n`)
+    const ctx = await mount({ projectRoot: 'D:/repo', artifactsRoot: join(root, 'runs'), detection: { provider: 'csv', csvPath: csv } }, fakeRunner(GIT_OK))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    const { runPaths } = await import('../src/core/artifacts.ts')
+    const corrupt = 'scan-20260920-050000-cccc.json'
+    await writeFile(join(runPaths(join(root, 'runs'), 'r1').dir, 'jobs', corrupt), '{"job_id":', 'utf8')
+
+    const status = await call(ctx, 'clone_check', { run_id: 'r1', what: 'status' })
+    expect((status as { isError?: boolean }).isError, rendered(status)).not.toBe(true)
+    const payload = JSON.parse(rendered(status)) as { job: { status: string } | null, unreadable_jobs: string[] }
+    // The newest READABLE record is still reported, and the file that was skipped is
+    // named rather than dropped: a silent skip would report an older job as newest.
+    expect(payload.job?.status).toBe('succeeded')
+    expect(payload.unreadable_jobs).toEqual([corrupt])
+  })
 })
 
 describe('clone_submit', () => {
@@ -459,11 +487,11 @@ describe('clone_verify', () => {
       // it refuses to start, while clone_verify must read the patch.
       ['git status --porcelain', [
         { stdout: '' },
-        { stdout: ' M module/laws/src/a.cpp\n M module/laws/src/sneaky.cpp\n' },
+        { stdout: ' M module/laws/src/a.cpp\u0000 M module/laws/src/sneaky.cpp\u0000' },
       ]],
-      ['git diff --name-only abc123', [
+      ['git diff --name-only -z abc123', [
         { stdout: '' },
-        { stdout: 'module/laws/src/a.cpp\nmodule/laws/src/sneaky.cpp\n' },
+        { stdout: 'module/laws/src/a.cpp\u0000module/laws/src/sneaky.cpp\u0000' },
       ]],
       ...GIT_OK,
     ]))
@@ -490,6 +518,67 @@ describe('clone_verify', () => {
     // A frozen run must not have started a verification job.
     const status = JSON.parse(rendered(await call(ctx, 'clone_check', { run_id: 'r1', what: 'status' }))) as { job: { kind: string } | null }
     expect(status.job?.kind).toBe('scan')
+  })
+
+  it('does not freeze a run whose only changed file has a space in its name', async () => {
+    // The non-`-z` forms C-quote exactly this path (` M "my helper.cpp"`), so the old
+    // read produced a string that could never equal the real one and clone_verify
+    // froze a legitimate run with UNAUTHORIZED_CHANGES naming a file that does not
+    // exist. Chinese filenames and Windows paths with spaces are ordinary here.
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    const spaced = 'module/laws/src/my helper.cpp'
+    await writeFile(csv, `${CSV_HEADER}p1,${spaced},ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true },
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
+    }, fakeRunner([
+      // First-match-wins, so the narrow entries precede GIT_OK. The plain entries are
+      // what git really prints for this path; the fixed argv never reaches them, and
+      // they are here so this test also fails, for its own reason — a quoted path —
+      // if the `-z` read is ever taken away again.
+      ['git checkout -B', { stdout: '' }],
+      ['git status --porcelain -z', [
+        { stdout: '' },
+        { stdout: ` M ${spaced}\u0000` },
+      ]],
+      ['git status --porcelain', [
+        { stdout: '' },
+        { stdout: ` M "${spaced}"\n` },
+      ]],
+      ['git diff --name-only -z abc123', [
+        { stdout: '' },
+        { stdout: `${spaced}\u0000` },
+      ]],
+      ['git diff --name-only abc123', [
+        { stdout: '' },
+        { stdout: `"${spaced}"\n` },
+      ]],
+      ...GIT_OK,
+      ['msbuild', { stdout: 'Build succeeded\n' }],
+    ]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    const assessed = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'the helper is the same computation', files_changed: [spaced],
+      evidence: { file: spaced, line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    expect((assessed as { isError?: boolean }).isError, rendered(assessed)).not.toBe(true)
+
+    const verified = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect(rendered(verified), 'a space in a path must not freeze the run').not.toMatch(/UNAUTHORIZED_CHANGES/)
+    expect((verified as { isError?: boolean }).isError, rendered(verified)).not.toBe(true)
+    await settle(ctx, 'r1')
+    const runDir = join(root, 'runs', 'r1', 'verify', '1')
+    const audit = JSON.parse(await readFile(join(runDir, 'reconcile.json'), 'utf8')) as { changed: string[], unauthorized: string[] }
+    expect(audit.changed).toEqual([spaced])
+    expect(audit.unauthorized).toEqual([])
+    expect((JSON.parse(await readFile(join(runDir, 'result.json'), 'utf8')) as { ok: boolean }).ok).toBe(true)
   })
 })
 
@@ -534,7 +623,8 @@ describe('clone_verify auto-rollback', () => {
     expect(result.rolled_back).toBe(true)
     expect(result.rollback_files).toEqual(['module/laws/src/a.cpp'])
     // Pins that the flag is not merely recorded: the restoring command really ran.
-    expect(runner.calls.some(call => call.argv[1] === 'restore')).toBe(true)
+    // Matched on the whole argv because `--literal-pathspecs` now precedes the verb.
+    expect(runner.calls.some(call => call.argv.includes('restore'))).toBe(true)
   })
 
   it('persists the result even when the rollback itself fails', async () => {
@@ -548,8 +638,8 @@ describe('clone_verify auto-rollback', () => {
     const runner = fakeRunner([
       ['git checkout -B', { stdout: '' }],
       // The tracked file is known to git, but restoring it fails.
-      ['git ls-files', { stdout: 'module/laws/src/a.cpp\u0000' }],
-      ['git restore', { exitCode: 1, stderr: 'error: pathspec did not match' }],
+      ['git --literal-pathspecs ls-files', { stdout: 'module/laws/src/a.cpp\u0000' }],
+      ['git --literal-pathspecs restore', { exitCode: 1, stderr: 'error: pathspec did not match' }],
       CLEAN_THEN_PATCHED,
       ...GIT_OK,
     ])
@@ -598,7 +688,7 @@ describe('clone_verify auto-rollback', () => {
       ['git checkout -B', { stdout: '' }],
       ...ROLLBACK_CALLS,
       // The tree is already dirty before the run starts, and stays that way.
-      ['git status --porcelain', { stdout: ' M module/laws/src/a.cpp\n' }],
+      ['git status --porcelain', { stdout: ' M module/laws/src/a.cpp\u0000' }],
       ...GIT_OK,
     ])
     // allowDirty is what admits an operator with work in progress; the baseline
@@ -631,7 +721,8 @@ describe('clone_verify auto-rollback', () => {
     expect(result.rollback_files).toEqual([])
     // The destructive commands must not have run at all: `git restore` would
     // discard the operator's uncommitted edits and `git clean` their own files.
-    expect(runner.calls.filter(call => call.argv[1] === 'restore' || call.argv[1] === 'clean')).toEqual([])
+    // (`--literal-pathspecs` precedes the verb, so the whole argv is searched.)
+    expect(runner.calls.filter(call => call.argv.includes('restore') || call.argv.includes('clean'))).toEqual([])
     const run = JSON.parse(await readFile(join(root, 'runs', 'r1', 'run.json'), 'utf8')) as { baseline: { dirty: string[] } }
     expect(run.baseline.dirty).toEqual(['module/laws/src/a.cpp'])
   })
@@ -766,8 +857,8 @@ describe('the whole chain', () => {
       // 覆盖项必须写在 `...GIT_OK` **之前**：fakeRunner 返回首个前缀匹配，而 GIT_OK 里
       // 已经有 `git status --porcelain` / `git diff --name-only` 条目，写在后面会被它们
       // 遮蔽，测试于是永远看不到这两个"被改动的文件"，冻结逻辑根本不会被触发。
-      ['git status --porcelain', { stdout: ' M module/laws/src/a.cpp\n M module/laws/src/sneaky.cpp\n' }],
-      ['git diff --name-only', { stdout: 'module/laws/src/a.cpp\nmodule/laws/src/sneaky.cpp\n' }],
+      ['git status --porcelain', { stdout: ' M module/laws/src/a.cpp\u0000 M module/laws/src/sneaky.cpp\u0000' }],
+      ['git diff --name-only', { stdout: 'module/laws/src/a.cpp\u0000module/laws/src/sneaky.cpp\u0000' }],
       ...GIT_OK,
     ]))
     await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })

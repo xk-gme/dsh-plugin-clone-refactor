@@ -134,8 +134,11 @@ function tempPath(file: string): string {
  * The rename goes through `renameWithRetry`: a concurrent reader makes the plain
  * rename fail on Windows, and a caller that swallowed that failure would leave the
  * previous contents in place, which for a job record means a task that finished
- * still reads as `running`. A failed write also removes its temp file, so a crash
- * cannot leave debris for a later directory listing to mistake for a record.
+ * still reads as `running`. A write that FAILS removes its own temp file, so the
+ * debris of a failed write does not accumulate. A process killed between the write
+ * and the rename still leaks that temp — nothing can clean up after a crash — and
+ * nothing can mistake it for a record either, because every reader filters for
+ * `.json` rather than treating a directory listing as the record set.
  */
 export async function writeAtomic(file: string, text: string): Promise<void> {
   await ensureDir(dirname(file))

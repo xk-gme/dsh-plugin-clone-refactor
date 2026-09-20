@@ -82,7 +82,14 @@ export async function finishJob(
 }
 
 /** The newest job of a run, by start time then id: what a poller reports. */
-export async function latestJob(paths: RunPaths): Promise<JobRecord | undefined> {
+export async function latestJob(
+  paths: RunPaths,
+  /**
+   * Called for a `<id>.json` that could not be read as a job record, so a skip is
+   * visible rather than silent. A corrupt file is not dropped from the poll.
+   */
+  onUnreadable?: (name: string, error: Error) => void,
+): Promise<JobRecord | undefined> {
   let names: string[]
   try {
     names = await readdir(join(paths.dir, 'jobs'))
@@ -91,12 +98,42 @@ export async function latestJob(paths: RunPaths): Promise<JobRecord | undefined>
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
     throw error
   }
-  const jobs = (await Promise.all(names.filter(name => name.endsWith('.json')).map(name => loadJob(paths, name.slice(0, -5)))))
-    .filter((job): job is JobRecord => job !== undefined)
+  const jobs: JobRecord[] = []
+  for (const name of names.filter(name => name.endsWith('.json'))) {
+    let job: JobRecord | undefined
+    try {
+      job = asJobRecord(await loadJob(paths, name.slice(0, -5)))
+    } catch (error) {
+      // Disk damage or tampering. `clone_check` is the only progress interface this
+      // plugin has, so one unreadable file may not turn every poll into an
+      // exception: the run would become unobservable, which is worse than reporting
+      // the newest READABLE record. The name still reaches the caller's hook.
+      onUnreadable?.(name, asError(error))
+      continue
+    }
+    if (job === undefined) {
+      // Valid JSON, but not a record: `{}.started_at` would also break the sort below.
+      onUnreadable?.(name, new Error(`${name} is not a job record`))
+      continue
+    }
+    jobs.push(job)
+  }
   if (jobs.length === 0) return undefined
   return jobs.sort((left, right) => (left.started_at === right.started_at
     ? left.job_id.localeCompare(right.job_id)
     : left.started_at.localeCompare(right.started_at))).at(-1)
+}
+
+/** The shape a job record must have for the sort above to be well defined. */
+function asJobRecord(value: unknown): JobRecord | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  const job = value as Partial<JobRecord>
+  return typeof job.job_id === 'string' && typeof job.started_at === 'string' ? job as JobRecord : undefined
+}
+
+/** Any thrown value as an Error, so `PersistFailure` always carries one. */
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error))
 }
 
 /**
@@ -124,7 +161,7 @@ async function settle<T>(
     await finishJob(paths, job, 'failed', error instanceof Error ? error.message : String(error), '')
       .catch((writeError: unknown) => onPersistFailure?.({
         job,
-        error: writeError instanceof Error ? writeError : new Error(String(writeError)),
+        error: asError(writeError),
         note: 'the job stays running although its task failed',
       }))
     throw error
@@ -132,10 +169,27 @@ async function settle<T>(
   // Success is reported the same way: swallowing this would leave a finished
   // job's on-disk record still claiming `running`, so a poller could not tell a
   // settled task from an unsettled one.
-  await finishJob(paths, job, 'succeeded', null, summarize?.(value) ?? '')
+  //
+  // `summarize` is evaluated HERE, inside the guarded region, and not as an argument
+  // to `finishJob`: as an argument it ran before the call, so a throw escaped `settle`
+  // — rejecting a task that had actually succeeded, skipping the hook, and leaving
+  // the record at `running`. That is the same silent wedge by another route. Failing
+  // to render the summary is a failure to persist part of this record, so it goes to
+  // the same hook, and the terminal status is written anyway.
+  let summary = ''
+  try {
+    summary = summarize?.(value) ?? ''
+  } catch (error) {
+    onPersistFailure?.({
+      job,
+      error: asError(error),
+      note: 'the job succeeded but its summary could not be rendered; its terminal status was written without one',
+    })
+  }
+  await finishJob(paths, job, 'succeeded', null, summary)
     .catch((writeError: unknown) => onPersistFailure?.({
       job,
-      error: writeError instanceof Error ? writeError : new Error(String(writeError)),
+      error: asError(writeError),
       note: 'the job stays running although its task succeeded',
     }))
   return value

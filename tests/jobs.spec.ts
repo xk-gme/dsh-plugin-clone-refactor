@@ -25,8 +25,19 @@ async function unpersistablePaths(): Promise<ReturnType<typeof runPaths>> {
   return target
 }
 
-async function settled(): Promise<void> {
-  await new Promise(resolve => setTimeout(resolve, 50))
+/**
+ * Wait for a condition instead of sleeping a fixed span (R8). A detached task has
+ * no promise to await, so the only thing a test can observe is state; polling that
+ * state is deterministic, while a constant sleep both slows the suite and turns the
+ * measured 0–3 ms detach→hook latency into a machine-speed coin flip.
+ */
+async function waitFor<T>(read: () => Promise<T>, done: (value: T) => boolean, label: string): Promise<T> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const value = await read()
+    if (done(value)) return value
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  throw new Error(`timed out waiting for ${label}`)
 }
 
 /** A record whose job file can never be written, because `jobs/` is a file. */
@@ -73,6 +84,32 @@ describe('job records', () => {
     const expected = [first.job_id, second.job_id, older.job_id].sort().at(-1)
     expect((await latestJob(target))?.job_id).toBe(expected)
   })
+
+  it('polls past a corrupt job file instead of failing every read', async () => {
+    const target = await paths()
+    const good = await startJob(target, 'run-1', 'scan', new Date('2026-09-20T01:00:00Z'))
+    // Disk damage or tampering: a `<id>.json` that is not JSON at all. `clone_check`
+    // is the interface the plugin's own guidance polls, so one such file must not
+    // turn every poll into an exception.
+    const corrupt = 'scan-20260920-030000-aaaa.json'
+    await writeFile(join(target.dir, 'jobs', corrupt), '{"job_id":', 'utf8')
+    const unreadable: string[] = []
+    expect((await latestJob(target, name => { unreadable.push(name) }))?.job_id).toBe(good.job_id)
+    // Skipped, not silently dropped: the caller is told which file it could not read.
+    expect(unreadable).toEqual([corrupt])
+  })
+
+  it('polls past a job file that is JSON but not a job record', async () => {
+    const target = await paths()
+    const good = await startJob(target, 'run-1', 'scan', new Date('2026-09-20T01:00:00Z'))
+    // Parses fine, so it survives `readJson`, and then poisons the newest-by-start-time
+    // sort: `{}.started_at` is undefined and `localeCompare` throws on it.
+    const notARecord = 'verify-20260920-040000-bbbb.json'
+    await writeFile(join(target.dir, 'jobs', notARecord), '{}\n', 'utf8')
+    const unreadable: string[] = []
+    expect((await latestJob(target, name => { unreadable.push(name) }))?.job_id).toBe(good.job_id)
+    expect(unreadable).toEqual([notARecord])
+  })
 })
 
 describe('detach', () => {
@@ -103,13 +140,44 @@ describe('detach', () => {
   })
 })
 
+describe('a summarize that throws', () => {
+  it('cannot reject a successful task or leave its record running', async () => {
+    const target = await paths()
+    const job = await startJob(target, 'run-1', 'scan')
+    const notes: string[] = []
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      // `summarize` is caller-supplied: passing it straight to `finishJob` evaluated
+      // it OUTSIDE the guarded region, so a throw escaped `settle`, skipped the hook
+      // and left the record at `running` — the silent wedge, by another route.
+      detach(target, job, async () => 42, () => { throw new Error('cannot render the summary') },
+        info => { notes.push(info.note) })
+      await waitFor(async () => (await loadJob(target, job.job_id))?.status, status => status !== 'running',
+        'the terminal status of a task whose summarize threw')
+      await new Promise(resolve => setTimeout(resolve, 0))
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+    const stored = await loadJob(target, job.job_id)
+    expect(stored?.status).toBe('succeeded')
+    expect(stored?.summary).toBe('')
+    expect(notes).toHaveLength(1)
+    expect(notes[0]).toMatch(/summar/)
+    // A rejected `settle` here would be swallowed by `detach` and never observed,
+    // which is exactly why the record and the hook, not the promise, are asserted.
+    expect(unhandled).toEqual([])
+  })
+})
+
 describe('a terminal write that cannot land', () => {
   it('reports the persistence failure to the caller instead of hiding it', async () => {
     const target = await unpersistablePaths()
     const failures: Array<{ job: string, message: string, note: string }> = []
     detach(target, unwritableJob(), async () => { throw new Error('pipeline exploded') },
       undefined, info => { failures.push({ job: info.job.job_id, message: info.error.message, note: info.note }) })
-    await settled()
+    await waitFor(async () => failures.length, length => length > 0, 'the persistence-failure hook')
 
     // The hook reports the write error, not the task error: the task's own
     // failure is already what the job record would have carried.
@@ -117,16 +185,24 @@ describe('a terminal write that cannot land', () => {
     expect(failures[0]?.job).toBe('scan-unwritable')
     expect(failures[0]?.message).toMatch(/EEXIST/)
     expect(failures[0]?.note).toMatch(/stays running/)
+    // Which branch fired decides what the note says, and a caller that only counted
+    // the calls could not tell a failed terminal write from a successful one's.
+    expect(failures[0]?.note).toMatch(/failed/)
   })
 
   it('reports a failure to record success too, not only a failed task', async () => {
     const target = await unpersistablePaths()
-    let reported = 0
-    detach(target, unwritableJob(), async () => 42, () => 'answered 42', () => { reported += 1 })
-    await settled()
+    const notes: string[] = []
+    detach(target, unwritableJob(), async () => 42, () => 'answered 42', info => { notes.push(info.note) })
+    await waitFor(async () => notes.length, length => length > 0, 'the success-path persistence failure')
 
     // The task succeeded, but the record still says running: the poller must be told.
-    expect(reported).toBe(1)
+    // The count alone is not enough — a relabelled success (reported with the
+    // failure path's note) is exactly the defect this has to catch, so the branch
+    // that fired is what gets asserted.
+    expect(notes).toHaveLength(1)
+    expect(notes[0]).toMatch(/stays running/)
+    expect(notes[0]).toMatch(/succeeded/)
   })
 
   it('survives a persistent write failure without an unhandled rejection', async () => {
@@ -135,8 +211,14 @@ describe('a terminal write that cannot land', () => {
     const onUnhandled = (reason: unknown): void => { unhandled.push(reason) }
     process.on('unhandledRejection', onUnhandled)
     try {
-      detach(target, unwritableJob(), async () => { throw new Error('pipeline exploded') })
-      await settled()
+      // The hook is the only observable boundary of a detached task whose record
+      // can never be written; waiting for it replaces the fixed sleep with the
+      // task's own completion. A late rejection still gets its own turn below.
+      const caught: string[] = []
+      detach(target, unwritableJob(), async () => { throw new Error('pipeline exploded') },
+        undefined, info => { caught.push(info.note) })
+      await waitFor(async () => caught.length, length => length > 0, 'the failed terminal write')
+      await new Promise(resolve => setTimeout(resolve, 0))
     } finally {
       process.off('unhandledRejection', onUnhandled)
     }

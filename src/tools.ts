@@ -143,7 +143,14 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       if (args.what === 'status') {
         // `null`, never `undefined`: an absent key would vanish from the JSON the
         // model reads, and a poller could not tell "no job yet" from a lost field.
-        return asJson({ run_id: runId, what: 'status', job: (await latestJob(paths)) ?? null })
+        // A corrupt `<id>.json` is skipped rather than failing the poll, and its name
+        // is reported here: a silent skip would present an older job as the newest.
+        const unreadableJobs: string[] = []
+        const job = await latestJob(paths, (name, error) => {
+          unreadableJobs.push(name)
+          ctx.logger.warn(`gme-clone-refactor: ignoring unreadable job record ${name}: ${error.message}`)
+        })
+        return asJson({ run_id: runId, what: 'status', job: job ?? null, unreadable_jobs: unreadableJobs })
       }
       if (args.what === 'ledger') {
         const { latest, droppedLines } = await loadAssessments(paths)
@@ -296,8 +303,13 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       }
       const patches = await loadPatches(paths)
       const authorized = authorizedFiles(patches)
-      const status = await runner.run({ argv: ['git', 'status', '--porcelain'], cwd: record.project_root, timeoutMs: 60_000, signal: undefined })
-      const diff = await runner.run({ argv: ['git', 'diff', '--name-only', record.baseline.head], cwd: record.project_root, timeoutMs: 60_000, signal: undefined })
+      // `-z` on both reads: it is the only form that survives a path containing a
+      // space or a non-ASCII character. The default forms C-quote and octal-escape
+      // such paths, so the parsers below could produce a string that never equals the
+      // real one and freeze a legitimate run with UNAUTHORIZED_CHANGES naming a file
+      // that does not exist.
+      const status = await runner.run({ argv: ['git', 'status', '--porcelain', '-z'], cwd: record.project_root, timeoutMs: 60_000, signal: undefined })
+      const diff = await runner.run({ argv: ['git', 'diff', '--name-only', '-z', record.baseline.head], cwd: record.project_root, timeoutMs: 60_000, signal: undefined })
       const changed = [...new Set([...parsePorcelain(status.stdout), ...parseNameOnly(diff.stdout)])]
       const audit = reconcile(authorized, changed)
       const attempt = (await loadVerifyAttempts(paths)).length + 1

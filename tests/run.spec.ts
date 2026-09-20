@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resolveSettings } from '../src/config.ts'
-import { artifactsRootOf, loadRun, openRun } from '../src/core/run.ts'
+import { artifactsRootOf, loadRun, openRun, saveRun } from '../src/core/run.ts'
 import { fakeRunner } from './fixtures/fake-runner.ts'
 
 const cleanups: Array<() => Promise<unknown>> = []
@@ -72,7 +72,7 @@ describe('openRun', () => {
     const dirty: Array<[string, { stdout?: string }]> = [
       ['git rev-parse HEAD', { stdout: 'abc123\n' }],
       ['git rev-parse --abbrev-ref HEAD', { stdout: 'main\n' }],
-      ['git status --porcelain', { stdout: ' M src/a.cpp\n' }],
+      ['git status --porcelain', { stdout: ' M src/a.cpp\u0000' }],
     ]
     await expect(openRun({ settings: resolveSettings({ projectRoot: 'D:/repo' }).settings, runner: fakeRunner(dirty), artifactsRoot, runId: 'run-4' }))
       .rejects.toThrow(/not clean.*workdir\.allowDirty/is)
@@ -90,5 +90,41 @@ describe('openRun', () => {
   it('refuses to run without a project root', async () => {
     await expect(openRun({ settings: resolveSettings({}).settings, runner: fakeRunner(GIT_OK), artifactsRoot: 'D:/runs', runId: 'run-6' }))
       .rejects.toThrow(/projectRoot/)
+  })
+
+  it('never writes the embedding API key into run.json', async () => {
+    const artifactsRoot = await root()
+    const runner = fakeRunner(GIT_OK)
+    const { settings } = resolveSettings({
+      projectRoot: 'D:/repo',
+      detection: { embeddingApiBase: 'https://embed.example/v1', embeddingApiKey: 'secret-key' },
+      verify: { keepFailedPatch: true },
+    })
+    const opened = await openRun({ settings, runner, artifactsRoot, runId: 'run-key' })
+    // The document says a run directory may be copied or published; the key must not
+    // travel with it. The on-disk text is what matters, not the returned record.
+    const written = await readFile(opened.paths.runJson, 'utf8')
+    expect(written).not.toContain('secret-key')
+    expect(written).toContain('[redacted]')
+    // Nothing else about the snapshot changed: the rest of detection and the flags
+    // the readers actually use (authorization, verify.keepFailedPatch) survive.
+    const stored = JSON.parse(written) as { settings: { detection: { embeddingApiBase: string, embeddingApiKey: string }, verify: { keepFailedPatch: boolean } } }
+    expect(stored.settings.detection.embeddingApiBase).toBe('https://embed.example/v1')
+    expect(stored.settings.detection.embeddingApiKey).toBe('[redacted]')
+    expect(stored.settings.verify.keepFailedPatch).toBe(true)
+
+    // The in-memory record still carries the live key: only the persisted copy is
+    // redacted, so the detection call this run makes is unaffected.
+    expect(opened.record.settings.detection.embeddingApiKey).toBe('secret-key')
+
+    // A resumed run reads the redacted record back and must keep working, including
+    // when it rewrites that record: the redaction has to survive a load/save cycle.
+    const resumed = await openRun({ settings, runner, artifactsRoot, runId: 'run-key' })
+    expect(resumed.created).toBe(false)
+    expect(resumed.record.settings.detection.embeddingApiKey).toBe('[redacted]')
+    await saveRun(resumed.paths, resumed.record)
+    const rewritten = await readFile(resumed.paths.runJson, 'utf8')
+    expect(rewritten).not.toContain('secret-key')
+    expect((await loadRun(resumed.paths))?.settings.verify.keepFailedPatch).toBe(true)
   })
 })

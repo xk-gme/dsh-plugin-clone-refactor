@@ -63,9 +63,32 @@ function rowGet(row: Record<string, string>, ...names: string[]): string {
 interface Node { file: string; func: string; lines: string }
 type Pair = ClonePair & { leftNode: Node; rightNode: Node }
 
+/**
+ * The column aliases each side of a pair is read from. Exported through
+ * {@link hasCloneColumns} so a detector can tell a header this parser cannot read
+ * from a report that simply has no clones.
+ */
+const FILE_ALIASES: Record<'1' | '2', readonly string[]> = {
+  1: ['file1', 'path1', 'file_1', 'path_1'],
+  2: ['file2', 'path2', 'file_2', 'path_2'],
+}
+
+/**
+ * Whether a header can yield a clone pair at all.
+ *
+ * `pairsFrom` drops every row whose left or right file is empty, so a header missing
+ * either side's file aliases produces zero records no matter what the rows say. That
+ * is a report this parser does not understand, not a module without clones, and the
+ * two must not be reported the same way.
+ */
+export function hasCloneColumns(header: readonly string[]): boolean {
+  const names = new Set(header)
+  return FILE_ALIASES['1'].some(alias => names.has(alias)) && FILE_ALIASES['2'].some(alias => names.has(alias))
+}
+
 function nodeFor(row: Record<string, string>, suffix: '1' | '2'): Node {
   return {
-    file: normalizePath(rowGet(row, `file${suffix}`, `path${suffix}`, `file_${suffix}`, `path_${suffix}`)),
+    file: normalizePath(rowGet(row, ...FILE_ALIASES[suffix])),
     func: rowGet(row, `func${suffix}_name`, `function${suffix}`, `func_${suffix}`, `function_${suffix}`),
     lines: rowGet(row, `lines${suffix}`, `line_range${suffix}`, `range${suffix}`, `lines_${suffix}`),
   }

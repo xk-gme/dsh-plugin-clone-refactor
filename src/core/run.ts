@@ -35,6 +35,35 @@ export async function loadRun(paths: RunPaths): Promise<RunRecord | undefined> {
   return await readJson<RunRecord>(paths.runJson)
 }
 
+/** What replaces a credential in the persisted snapshot. */
+const REDACTED = '[redacted]'
+
+/**
+ * The record as it may exist on disk.
+ *
+ * `JSON.stringify(record)` used to write the whole `Settings` snapshot — including
+ * `detection.embeddingApiKey` — into `run.json`, which is the artifact the docs tell
+ * operators they may copy or publish. The key is redacted here, at the one boundary
+ * where a record becomes bytes, so no other path can reintroduce it. Nothing reads
+ * it back: `record.settings` is consulted for `authorization` and
+ * `verify.keepFailedPatch` only, and detection reads the LIVE settings, so every
+ * field a reader needs survives this unchanged. An empty key stays empty rather than
+ * claiming a credential was withheld.
+ */
+function serializeRun(record: RunRecord): string {
+  const persisted: RunRecord = {
+    ...record,
+    settings: {
+      ...record.settings,
+      detection: {
+        ...record.settings.detection,
+        embeddingApiKey: record.settings.detection.embeddingApiKey === '' ? '' : REDACTED,
+      },
+    },
+  }
+  return `${JSON.stringify(persisted, null, 2)}\n`
+}
+
 export interface OpenRunOptions {
   settings: Settings
   runner: CommandRunner
@@ -86,13 +115,15 @@ export async function openRun(options: OpenRunOptions): Promise<OpenedRun> {
     updated_at: stamp,
     settings,
   }
-  await writeAtomic(paths.runJson, `${JSON.stringify(record, null, 2)}\n`)
+  await writeAtomic(paths.runJson, serializeRun(record))
   return { record, paths, created: true }
 }
 
 /** Persist a mutated run record (status, provider choice, timestamps). */
 export async function saveRun(paths: RunPaths, record: RunRecord, now: Date = new Date()): Promise<RunRecord> {
   const updated: RunRecord = { ...record, updated_at: now.toISOString() }
-  await writeAtomic(paths.runJson, `${JSON.stringify(updated, null, 2)}\n`)
+  // The same boundary as `openRun`. A record loaded from disk is already redacted,
+  // so rewriting it keeps the redaction rather than laundering a key back in.
+  await writeAtomic(paths.runJson, serializeRun(updated))
   return updated
 }
