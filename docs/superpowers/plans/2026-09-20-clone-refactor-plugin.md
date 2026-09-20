@@ -69,13 +69,19 @@ dsh-gme-clone-refactor/
     └── fixtures/                    sample_func_clone.csv、sample_run/…
 ```
 
-**依赖方向（严格单向，任何任务都不得违反）：**
+**依赖方向（严格单向）：**
 
 ```
 tools → core → {detect, verify, git, submit, report}
 detect / verify / git / submit / report → core/command.ts（接口，仅类型）
 index.ts（组合根）→ 唯一的 core/command-host.ts 导入者
 ```
+
+> **R60 的枚举式例外（最终整支复审裁定，2026-09-20）。** 上面的规则原先写成"任何任务都不得违反"，但实现里存在**一条**边违反它：`src/core/run.ts` 从 `../git/baseline.ts` 导入 `readBaseline`/`createBranch`/`Baseline`。成因是计划自己造的：baseline 放在 `git/`（Task 5）、run 生命周期放在 `core/run.ts`（Task 6），又要求生命周期读 baseline。复审对三条补救的裁决是**修订规则**而不是改代码：
+> - **允许**：`core/run.ts` 可以且只可以从 `git/baseline.ts` 导入 `readBaseline`、`createBranch`、`Baseline` —— 别处一律不许有 `core → capability` 的边。
+> - **必须保持**：`git/baseline.ts` 对 `core/command.ts` 的导入是 **`import type`**，正是它让这张图无环；改成值导入就会造出真正的循环。
+> - **不加例外给"把文件搬到 core/ 让 grep 通过"**：那只是搬代码，依赖还在，而这是最糟的一种"修好"。
+> - **纸面规则必须配机械守卫**：`tests/layering.spec.ts` 扫描 `src/` 的相对导入，任何第二条 `core → capability` 边、或 `git/baseline.ts` 里非 `import type` 的 `core/command.ts` 导入，都要让构建变红。（"不写在纸上就等于没写"——这条例外与守卫同时落地。）
 
 ---
 
