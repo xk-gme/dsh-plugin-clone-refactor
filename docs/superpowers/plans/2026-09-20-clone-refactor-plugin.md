@@ -3768,6 +3768,14 @@ describe('renderCommitMessage', () => {
 
   it('leaves an unknown placeholder alone instead of blanking it', () => {
     expect(renderCommitMessage('x {nope} y', {})).toBe('x {nope} y')
+    // The rule has to hold for names that exist on Object.prototype too: a plain
+    // `values[name] ?? match` reads the prototype chain and would render
+    // "function Object() { [native code] }" (or "[object Object]" for `__proto__`)
+    // into a user's commit message. `Object.hasOwn` is what makes "unknown" mean
+    // "not supplied by the caller".
+    expect(renderCommitMessage('x {constructor} y', {})).toBe('x {constructor} y')
+    expect(renderCommitMessage('x {toString} y', {})).toBe('x {toString} y')
+    expect(renderCommitMessage('x {__proto__} y', {})).toBe('x {__proto__} y')
   })
 })
 
@@ -3794,15 +3802,35 @@ describe('submit', () => {
     const runner = fakeRunner([['git add', {}], ['git commit', {}], ['git push', { stdout: 'ok\n' }]])
     const result = await submit({ ...BASE, runner, mode: 'push' })
     expect(result.pushed).toBe(true)
-    expect(runner.calls[2]?.argv.join(' ')).toBe('git push -u origin clone-refactor/run-1')
+    // The whole sequence, by equality: a mode that ran one rung too many or too few
+    // has to fail this, not merely "something ran".
+    expect(runner.calls.map(call => call.argv.join(' '))).toEqual([
+      'git add -- module/laws/src/a.cpp',
+      'git commit -m refactor: dedupe ComputeArea',
+      'git push -u origin clone-refactor/run-1',
+    ])
   })
 
   it('opens a pull request against the configured base branch', async () => {
     const runner = fakeRunner([['git add', {}], ['git commit', {}], ['git push', {}], ['gh pr create', { stdout: 'https://github.com/x/y/pull/7\n' }]])
     const result = await submit({ ...BASE, runner, mode: 'pr' })
     expect(result.pr_url).toBe('https://github.com/x/y/pull/7')
+    // By equality, including the title and the body: a bare `toContain('--base')`
+    // would let a wrong title/body or an extra trailing command pass.
+    expect(runner.calls.map(call => call.argv.join(' '))).toEqual([
+      'git add -- module/laws/src/a.cpp',
+      'git commit -m refactor: dedupe ComputeArea',
+      'git push -u origin clone-refactor/run-1',
+      'gh pr create --base main --head clone-refactor/run-1 --title Clone refactor run-1 --body Deduplicated one clone family.',
+    ])
+  })
+
+  it('falls back to main when no base branch is configured', async () => {
+    // `submit.baseBranch` defaults to '' in the shipped config, so this is the path
+    // every unconfigured user takes — not a dead branch.
+    const runner = fakeRunner([['git add', {}], ['git commit', {}], ['git push', {}], ['gh pr create', { stdout: 'https://github.com/x/y/pull/8\n' }]])
+    await submit({ ...BASE, runner, mode: 'pr', baseBranch: '' })
     expect(runner.calls[3]?.argv.join(' ')).toContain('--base main')
-    expect(runner.calls[3]?.argv.join(' ')).toContain('--head clone-refactor/run-1')
   })
 
   it('stops before the pull request when the push fails', async () => {
@@ -3867,7 +3895,7 @@ export interface SubmitResult {
 
 /** Expand `{name}` placeholders; an unknown name is left visible, never blanked. */
 export function renderCommitMessage(template: string, values: Record<string, string>): string {
-  return template.replaceAll(/\{(\w+)\}/g, (match, name: string) => values[name] ?? match)
+  return template.replaceAll(/\{(\w+)\}/g, (match, name: string) => (Object.hasOwn(values, name) ? values[name] : match))
 }
 
 async function run(input: SubmitInput, argv: readonly string[], steps: string[]): Promise<string> {
