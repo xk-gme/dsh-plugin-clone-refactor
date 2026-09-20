@@ -54,6 +54,15 @@ function knownCluster(ids: readonly string[], requested: string): string {
   return requested
 }
 
+/**
+ * The files the user authorized, in one spelling. Both `clone_verify` (what may
+ * be reconciled) and `clone_submit` (what may be committed) must derive this the
+ * same way, or a file the user authorized would look unauthorized to one of them.
+ */
+function authorizedFiles(patches: readonly PatchRecord[]): string[] {
+  return [...new Set(patches.flatMap(patch => patch.files_changed.map(normalizePath)))].sort()
+}
+
 export function registerTools(ctx: Context, settings: Settings, runner: import('./core/command.ts').CommandRunner, artifactsRoot: string): void {
   ctx.tools.register(defineTool({
     name: 'clone_scan',
@@ -191,7 +200,11 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         // 不该逼人放弃整个 run。
         const authorization = record.settings.authorization
         if (!authorization.enabled) throw new Error('Patching is disabled: set authorization.enabled: true in the profile row before any run may change source.')
-        if (PRIORITY_RANK[args.priority] < PRIORITY_RANK[authorization.maxPriority]) {
+        // `maxPriority` 是**严重度上限**：本部署允许被 patch 的**最不严重**的那一档。
+        // P0 的 rank 是 0，所以"到 P1 为止"意味着 rank ≤ 1。原来的 `<` 写反了 —— 在随包
+        // 默认值 `maxPriority: 'P0'` 下它什么都不拒绝（连 §8 明说不得重构的 PX 都放行），
+        // 而一旦生效，它禁止的反而是**更严重**的那些簇。R48。
+        if (PRIORITY_RANK[args.priority] > PRIORITY_RANK[authorization.maxPriority]) {
           throw new Error(`authorization.maxPriority is ${authorization.maxPriority}, so a ${args.priority} cluster may not be patched in this deployment.`)
         }
         if (files.length === 0) throw new Error('A patched verdict needs files_changed: the authorization ledger is what clone_verify reconciles against.')
@@ -209,11 +222,21 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       }
       const { replaced } = await recordAssessment(paths, assessment, { replace: args.replace === true })
       if (args.verdict === 'patched') {
+        // Upsert, not insert-if-absent. A `replace: true` correction of
+        // `files_changed` must reach the ledger: `clone_verify` authorizes from
+        // `patches` alone, so a stale record would freeze a corrected run with
+        // UNAUTHORIZED_CHANGES that no further `clone_assess` could clear, and a
+        // too-wide one would let `clone_submit` commit files nobody authorized.
+        // The record keeps its position in the ledger so the ordering stays stable.
         const patches = await loadPatches(paths)
-        if (!patches.some(patch => patch.cluster_id === clusterId)) {
-          const added: PatchRecord = { cluster_id: clusterId, priority: args.priority, files_changed: files, recorded_at: assessment.recorded_at }
-          await savePatches(paths, [...patches, added])
+        const updated: PatchRecord = {
+          cluster_id: clusterId, priority: args.priority,
+          files_changed: files, recorded_at: assessment.recorded_at,
         }
+        const existing = patches.findIndex(patch => patch.cluster_id === clusterId)
+        await savePatches(paths, existing === -1
+          ? [...patches, updated]
+          : patches.map((patch, index) => (index === existing ? updated : patch)))
       }
       const { latest } = await loadAssessments(paths)
       const covered = clusters.filter(cluster => latest.has(cluster.id)).length
@@ -247,7 +270,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         throw new Error('verify.steps is empty, so nothing can be verified: configure this site\'s build/test steps before running clone_verify. An unverified patch must not be submitted.')
       }
       const patches = await loadPatches(paths)
-      const authorized = [...new Set(patches.flatMap(patch => patch.files_changed.map(normalizePath)))].sort()
+      const authorized = authorizedFiles(patches)
       const status = await runner.run({ argv: ['git', 'status', '--porcelain'], cwd: record.project_root, timeoutMs: 60_000, signal: undefined })
       const diff = await runner.run({ argv: ['git', 'diff', '--name-only', record.baseline.head], cwd: record.project_root, timeoutMs: 60_000, signal: undefined })
       const changed = [...new Set([...parsePorcelain(status.stdout), ...parseNameOnly(diff.stdout)])]
@@ -260,6 +283,13 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       const job = await startJob(paths, runId, 'verify')
       detach(paths, job, async () => {
         const result = await runVerification({ runner, paths, steps: settings.verify.steps, cwd: record.project_root, attempt, signal: undefined })
+        // Persist the outcome BEFORE the rollback. `checkoutFiles` throws when git
+        // refuses, and a throw here rejects the detached task, so writing last would
+        // leave the attempt with step logs but no result.json: the report would say
+        // no verification ran, and the next attempt would reuse this number and
+        // overwrite those logs. The evidence that verification ran is not the
+        // rollback's to erase.
+        await writeAtomic(join(paths.verifyDir, String(attempt), 'result.json'), `${JSON.stringify(result, null, 2)}\n`)
         // 自动回滚只在干净基线上才安全。`workdir.allowDirty` 意味着操作者手上本来就有
         // 未提交的工作：对被跟踪文件执行 `git restore --source=HEAD` 会抹掉他开跑前的
         // 改动，对未跟踪文件执行 `git clean` 会删掉他开跑前就存在的文件。此时只记录
@@ -268,8 +298,8 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
           await checkoutFiles(runner, record.project_root, authorized)
           result.rolled_back = true
           result.rollback_files = authorized
+          await writeAtomic(join(paths.verifyDir, String(attempt), 'result.json'), `${JSON.stringify(result, null, 2)}\n`)
         }
-        await writeAtomic(join(paths.verifyDir, String(attempt), 'result.json'), `${JSON.stringify(result, null, 2)}\n`)
         return result
       }, result => `attempt ${result.attempt}: ${result.ok ? 'PASS' : 'FAIL'}`)
       return { run_id: runId, job_id: job.job_id, accepted: true, attempt, authorized_files: authorized }
@@ -295,7 +325,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       const last = attempts.at(-1)
       if (last === undefined || !last.ok) throw new Error('No passing clone_verify for this run: nothing may be submitted before the build and tests pass.')
       const patches = await loadPatches(paths)
-      const files = [...new Set(patches.flatMap(patch => patch.files_changed.map(normalizePath)))].sort()
+      const files = authorizedFiles(patches)
       if (files.length === 0) throw new Error('The authorization ledger is empty: there is nothing to submit.')
       const mode = (args.mode ?? settings.submit.mode) as Settings['submit']['mode']
       const message = settings.submit.commitMessageTemplate === ''

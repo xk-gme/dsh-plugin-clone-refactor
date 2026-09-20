@@ -100,8 +100,15 @@ async function settle(ctx: Context, runId: string, attempts = 200): Promise<void
   throw new Error(`run ${runId} never settled`)
 }
 
+/** The attempt numbers a run has recorded, read through the public artifact reader. */
+async function loadVerifyAttemptsOf(root: string): Promise<number[]> {
+  const { loadVerifyAttempts } = await import('../src/verify/artifacts.ts')
+  const { runPaths } = await import('../src/core/artifacts.ts')
+  return (await loadVerifyAttempts(runPaths(join(root, 'runs'), 'r1'))).map(attempt => attempt.attempt)
+}
+
 describe('clone_assess authorization rules', () => {
-  it('refuses a patched verdict without confirm, and with patching disabled', async () => {
+  it('refuses a patched verdict while patching is disabled', async () => {
     const root = await workspace()
     const csv = join(root, 'func_clone_base.csv')
     await writeFile(csv, `${CSV_HEADER}p1,a.cpp,f,1-2,b.cpp,g,3-4,0.9,type12\n`)
@@ -113,6 +120,119 @@ describe('clone_assess authorization rules', () => {
     const assess = await call(ctx, 'clone_assess', { run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0', reason: 'x', files_changed: ['a.cpp'], confirm: true })
     expect((assess as { isError?: boolean }).isError).toBe(true)
     expect(rendered(assess)).toMatch(/authorization\.enabled/)
+  })
+
+  it('refuses a patched verdict without confirm: true', async () => {
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,a.cpp,f,1-2,b.cpp,g,3-4,0.9,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true },
+    }, fakeRunner([['git checkout -B', { stdout: '' }], ...GIT_OK]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    // Authorization is on, so consent is the only thing left to refuse it.
+    const assessed = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'bodies are identical', files_changed: ['module/laws/src/a.cpp'],
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'static int area(const Rect& r)' },
+    })
+    expect((assessed as { isError?: boolean }).isError).toBe(true)
+    expect(rendered(assessed)).toMatch(/confirm: true/)
+    // Nothing half-written: the refusal happens before the ledger is touched.
+    await expect(readFile(join(root, 'runs', 'r1', 'patches.json'), 'utf8')).rejects.toThrow()
+  })
+
+  it('caps patching at maxPriority severity, refusing the less severe side', async () => {
+    // The cap is a SEVERITY cap: maxPriority 'P0' means "only P0". The previous
+    // inverted comparison refused nothing at all under this default — including
+    // PX, which design §8 says must never be refactored — so this test fails
+    // unless the comparison is the right way round.
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true, maxPriority: 'P0' },
+    }, fakeRunner([['git checkout -B', { stdout: '' }], ...GIT_OK]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+
+    const patched = (priority: string) => call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority,
+      reason: 'bodies are identical', files_changed: ['module/laws/src/a.cpp'],
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+
+    const p1 = await patched('P1')
+    expect((p1 as { isError?: boolean }).isError).toBe(true)
+    expect(rendered(p1)).toMatch(/maxPriority is P0/)
+    // P0 is exactly what the cap allows, so the same call at P0 must succeed.
+    const p0 = await patched('P0')
+    expect((p0 as { isError?: boolean }).isError, rendered(p0)).not.toBe(true)
+  })
+
+  it('widens the authorization ledger when a patched verdict is replaced', async () => {
+    // Upsert, not insert-if-absent: clone_verify authorizes from patches.json
+    // alone, so a stale record would freeze this run with UNAUTHORIZED_CHANGES
+    // that no further clone_assess could clear.
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true },
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
+    }, fakeRunner([
+      ['git checkout -B', { stdout: '' }],
+      // The tree is clean at the baseline read and shows both authorized files to
+      // the reconcile, which is the state a widened patch really produces.
+      ['git status --porcelain', [
+        { stdout: '' },
+        { stdout: ' M module/laws/src/a.cpp\n M module/laws/src/b.cpp\n' },
+      ]],
+      ['git diff --name-only abc123', [
+        { stdout: '' },
+        { stdout: 'module/laws/src/a.cpp\nmodule/laws/src/b.cpp\n' },
+      ]],
+      ...GIT_OK,
+    ]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    const first = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'extracted a helper', files_changed: ['module/laws/src/a.cpp'],
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    expect((first as { isError?: boolean }).isError, rendered(first)).not.toBe(true)
+
+    const widened = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'the helper also touches b.cpp', files_changed: ['module/laws/src/a.cpp', 'module/laws/src/b.cpp'],
+      evidence: { file: 'module/laws/src/b.cpp', line: 33, snippet: 'return area(r);' },
+      replace: true, confirm: true,
+    })
+    expect((widened as { isError?: boolean }).isError, rendered(widened)).not.toBe(true)
+
+    const patches = JSON.parse(await readFile(join(root, 'runs', 'r1', 'patches.json'), 'utf8')) as Array<{
+      cluster_id: string; files_changed: string[]
+    }>
+    expect(patches).toHaveLength(1)
+    expect(patches[0]?.files_changed).toEqual(['module/laws/src/a.cpp', 'module/laws/src/b.cpp'])
+
+    // The point of the fix: the widened set is what authorizes, so verifying the
+    // corrected patch must not freeze the run.
+    const verified = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((verified as { isError?: boolean }).isError, rendered(verified)).not.toBe(true)
   })
 
   it('requires evidence for a P0 report_only verdict', async () => {
@@ -224,10 +344,10 @@ describe('clone_verify', () => {
       authorization: { enabled: true },
       verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
     }, fakeRunner([
-      // Order matters: `fakeRunner` returns the FIRST entry whose prefix matches,
-      // and each array is a sequence consumed one entry per call. `openRun` must
-      // read a clean tree or it refuses to start, while clone_verify must read the
-      // patch. The longer diff prefix also wins over GIT_OK's shorter one.
+      // Order matters: `fakeRunner` is FIRST-match-wins, not longest-prefix-wins,
+      // so these narrow entries must precede GIT_OK's broad ones. Each array is a
+      // sequence consumed one entry per call: `openRun` must read a clean tree or
+      // it refuses to start, while clone_verify must read the patch.
       ['git status --porcelain', [
         { stdout: '' },
         { stdout: ' M module/laws/src/a.cpp\n M module/laws/src/sneaky.cpp\n' },
@@ -324,6 +444,59 @@ describe('clone_verify auto-rollback', () => {
     expect(result.rollback_files).toEqual(['module/laws/src/a.cpp'])
     // Pins that the flag is not merely recorded: the restoring command really ran.
     expect(runner.calls.some(call => call.argv[1] === 'restore')).toBe(true)
+  })
+
+  it('persists the result even when the rollback itself fails', async () => {
+    // `checkoutFiles` throws when git refuses. Writing result.json after the
+    // rollback would leave this attempt with step logs but no result: the report
+    // would claim no verification ran, and the next attempt would reuse the number
+    // and overwrite those logs. The evidence must outlive the rollback's failure.
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const runner = fakeRunner([
+      ['git checkout -B', { stdout: '' }],
+      // The tracked file is known to git, but restoring it fails.
+      ['git ls-files', { stdout: 'module/laws/src/a.cpp\u0000' }],
+      ['git restore', { exitCode: 1, stderr: 'error: pathspec did not match' }],
+      CLEAN_THEN_PATCHED,
+      ...GIT_OK,
+    ])
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true },
+      verify: STEPS,
+    }, runner)
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'bodies are identical', files_changed: ['module/laws/src/a.cpp'],
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    await call(ctx, 'clone_verify', { run_id: 'r1' })
+    await settle(ctx, 'r1')
+
+    const result = JSON.parse(await readFile(join(root, 'runs', 'r1', 'verify', '1', 'result.json'), 'utf8')) as {
+      ok: boolean; rolled_back: boolean; steps: Array<{ name: string; log_file: string }>
+    }
+    expect(result.ok).toBe(false)
+    // The rollback threw, so it never got to claim success.
+    expect(result.rolled_back).toBe(false)
+    expect(result.steps.map(step => step.name)).toEqual(['build'])
+    // The step log the result points at survived, and the job records the failure.
+    await expect(readFile(result.steps[0]!.log_file, 'utf8')).resolves.toContain('msbuild tests.sln')
+    const status = JSON.parse(rendered(await call(ctx, 'clone_check', { run_id: 'r1', what: 'status' }))) as {
+      job: { kind: string; status: string; error: string | null }
+    }
+    expect(status.job?.kind).toBe('verify')
+    expect(status.job?.status).toBe('failed')
+    expect(status.job?.error).toMatch(/Cannot roll back/)
+    // And the next attempt must not be numbered 1 again.
+    await expect(loadVerifyAttemptsOf(root)).resolves.toEqual([1])
   })
 
   it('leaves a failed patch alone when the baseline was already dirty', async () => {
