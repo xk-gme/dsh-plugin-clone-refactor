@@ -681,3 +681,94 @@ describe('clone_report', () => {
     expect(findings[0]?.verdict).toBe('report_only')
   })
 })
+
+describe('the whole chain', () => {
+  it('scans, judges every cluster, verifies and reports', async () => {
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const gitAndBuild: Array<[string, { stdout?: string; exitCode?: number }]> = [
+      // 本测试把 C001 判为 `report_only`，因此**不记录任何 patch**：授权账本为空，而
+      // reconcile 会拿 `[]` 去比 `git diff` 报的东西。GIT_OK 的 diff 回答里有一个文件名，
+      // 那会让本测试期望成功的验证步骤先被冻结 —— 所以先报一个干净的工作区（首个前缀匹配
+      // 生效，覆盖项必须写在前面）。
+      ['git status --porcelain', { stdout: '' }],
+      ['git diff --name-only', { stdout: '' }],
+      ...GIT_OK,
+      ['msbuild', { stdout: 'Build succeeded\n' }],
+      ['tests.exe', { stdout: 'All tests passed\n' }],
+    ]
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      verify: { steps: [
+        { name: 'build', phase: 'build', command: 'msbuild tests.sln' },
+        { name: 'test', phase: 'test', command: 'tests.exe' },
+      ] },
+    }, fakeRunner(gitAndBuild))
+
+    const scan = await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    expect((scan as { isError?: boolean }).isError).not.toBe(true)
+    await settle(ctx, 'r1')
+
+    const assessed = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'report_only', priority: 'P1',
+      reason: 'renaming-only difference, but the callee is virtual',
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'virtual void draw();' },
+    })
+    expect((assessed as { isError?: boolean }).isError).not.toBe(true)
+
+    const verify = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((verify as { isError?: boolean }).isError).not.toBe(true)
+    await settle(ctx, 'r1')
+
+    const report = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((report as { isError?: boolean }).isError).not.toBe(true)
+    const summaryPath = join(root, 'runs', 'r1', 'summary.json')
+    const summary = JSON.parse(await readFile(summaryPath, 'utf8')) as { clusters: number; missing: number; verify_ok: boolean }
+    expect(summary.clusters).toBe(1)
+    expect(summary.missing).toBe(0)
+    expect(summary.verify_ok).toBe(true)
+    expect(await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')).toContain('msbuild tests.sln')
+  })
+
+  it('freezes the run when a file outside the ledger changed', async () => {
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true },
+      // 本测试的前提是"有一个改动落在账本之外"，那就意味着工作区是脏的；而默认的
+      // `workdir.allowDirty: false` 会拒绝在脏工作区上开跑，于是 clone_scan 会在冻结
+      // 被观察到之前就失败。这里必须显式允许脏基线。
+      workdir: { allowDirty: true },
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
+    }, fakeRunner([
+      // 覆盖项必须写在 `...GIT_OK` **之前**：fakeRunner 返回首个前缀匹配，而 GIT_OK 里
+      // 已经有 `git status --porcelain` / `git diff --name-only` 条目，写在后面会被它们
+      // 遮蔽，测试于是永远看不到这两个"被改动的文件"，冻结逻辑根本不会被触发。
+      ['git status --porcelain', { stdout: ' M module/laws/src/a.cpp\n M module/laws/src/sneaky.cpp\n' }],
+      ['git diff --name-only', { stdout: 'module/laws/src/a.cpp\nmodule/laws/src/sneaky.cpp\n' }],
+      // `authorization.enabled: true` 会让 openRun 建 run 分支，因此需要一条脚本化的
+      // `git checkout -B`，否则 clone_scan 会在断言之前就因未脚本化的命令而失败。
+      ['git checkout -B', {}],
+      ...GIT_OK,
+    ]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'body identical, extracted a helper', files_changed: ['module/laws/src/a.cpp'],
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    const verify = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((verify as { isError?: boolean }).isError).toBe(true)
+    expect(JSON.stringify(verify)).toMatch(/UNAUTHORIZED_CHANGES/)
+    expect(JSON.stringify(verify)).toMatch(/sneaky\.cpp/)
+  })
+})
