@@ -1649,8 +1649,8 @@ export function parseNameOnly(text: string): string[] {
 async function capture(runner: CommandRunner, cwd: string, argv: readonly string[]): Promise<string> {
   const result = await runner.run({ argv, cwd, timeoutMs: 60_000, signal: undefined })
   if (result.exitCode !== 0) {
-    // The same rendering as `detail`, not a second copy of it: the local copy this
-    // replaced printed an empty message whenever a failure produced no output.
+    // One rendering of a failed command, shared with `detail`: this replaced a
+    // character-identical inline copy, so the deduplication changed no behaviour.
     throw new Error(`${argv.join(' ')} failed in ${cwd}: ${detail(result)}`)
   }
   return result.stdout
