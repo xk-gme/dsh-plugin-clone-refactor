@@ -2814,11 +2814,43 @@ describe('runVerification', () => {
     expect(log).toContain('spill: D:/spill.txt')
   })
 
+  it('records the runner\'s real signal in the log instead of guessing from the exit code', async () => {
+    const target = await paths()
+    const runner = fakeRunner([['slow.exe', { exitCode: null, signal: 'SIGTERM', timedOut: true }]])
+    await runVerification({ runner, paths: target, attempt: 1, cwd: 'D:/repo', signal: undefined, steps: [step('slow', 'slow.exe')] })
+    const log = await readFile(join(target.verifyDir, '1', '1-slow.log'), 'utf8')
+    // The signal the runner reported, not an inference: a killed step must not read
+    // as "killed or never started", and a never-started step carries EXIT_NOT_RUN.
+    expect(log).toContain('signal: SIGTERM')
+    expect(log).not.toContain('killed or never started')
+  })
+
+  it('says so plainly when there was no signal at all', async () => {
+    const target = await paths()
+    const runner = fakeRunner([['ok.exe', {}]])
+    await runVerification({ runner, paths: target, attempt: 1, cwd: 'D:/repo', signal: undefined, steps: [step('ok', 'ok.exe')] })
+    expect(await readFile(join(target.verifyDir, '1', '1-ok.log'), 'utf8')).toContain('signal: none')
+  })
+
+  it('reports ok for an empty step list, and this test exists so no caller reads that as verified', async () => {
+    const target = await paths()
+    const runner = fakeRunner([])
+    const result = await runVerification({ runner, paths: target, attempt: 1, cwd: 'D:/repo', signal: undefined, steps: [] })
+    // Nothing required failed, so `ok` is vacuously true and nothing ran at all. The
+    // enforcement lives in the caller (Task 13 refuses an empty step list); pinning it
+    // here keeps the vacuity visible instead of letting it look like a real pass.
+    expect(result.ok).toBe(true)
+    expect(result.steps).toEqual([])
+    expect(runner.calls).toEqual([])
+  })
+
   it('runs the steps in a caller-supplied work directory', async () => {
     const target = await paths()
     const runner = fakeRunner([['msbuild', {}]])
-    await runVerification({ runner, paths: target, attempt: 1, cwd: 'D:/repo', signal: undefined, steps: [step('build', 'msbuild x.sln')] })
+    await runVerification({ runner, paths: target, attempt: 1, cwd: 'D:/repo', signal: undefined, steps: [step('build', 'msbuild tests.sln')] })
     expect(runner.calls[0]?.cwd).toBe('D:/repo')
+    // The configured command string must actually reach the runner as argv.
+    expect(runner.calls[0]?.argv).toEqual(['msbuild', 'tests.sln'])
   })
 })
 
@@ -2896,7 +2928,7 @@ export function logFileFor(paths: RunPaths, attempt: number, index: number, name
   return join(paths.verifyDir, String(attempt), `${index}-${safe}.log`)
 }
 
-function renderLog(step: VerifyStep, result: StepResult, cwd: string, stdout: string, stderr: string, spillPath: string | null): string {
+function renderLog(step: VerifyStep, result: StepResult, cwd: string, stdout: string, stderr: string, spillPath: string | null, signal: string | null): string {
   const lines = [
     `step: ${step.name}`,
     `phase: ${step.phase}`,
@@ -2905,7 +2937,11 @@ function renderLog(step: VerifyStep, result: StepResult, cwd: string, stdout: st
     `required: ${String(step.required)}`,
     `always: ${String(step.always)}`,
     `exit_code: ${String(result.exit_code)}`,
-    `signal: ${result.exit_code === null ? 'killed or never started' : 'none'}`,
+    // The runner's own signal — never an inference from a null exit code. A command
+    // that never started reports EXIT_NOT_RUN (-1), not null, so "null means it never
+    // started" would be a false statement inside the one artifact that *is* the
+    // evidence. StepResult has no field for the signal, so this line is its only home.
+    `signal: ${signal ?? (result.exit_code === null ? 'unknown' : 'none')}`,
     `timed_out: ${String(result.timed_out)}`,
     `lossy: ${String(result.lossy)}`,
   ]
@@ -2946,7 +2982,7 @@ export async function runVerification(options: EngineOptions): Promise<VerifyRes
       lossy: result.lossy,
     }
     await mkdir(attemptDir, { recursive: true })
-    await writeFile(stepResult.log_file, renderLog(step, stepResult, options.cwd, result.stdout, result.stderr, result.spillPath), 'utf8')
+    await writeFile(stepResult.log_file, renderLog(step, stepResult, options.cwd, result.stdout, result.stderr, result.spillPath, result.signal), 'utf8')
     results.push(stepResult)
     // Only a required step can fail the run: an optional step that fails is
     // bookkeeping, not evidence about the patch. An `always` step that fails is
@@ -2956,6 +2992,10 @@ export async function runVerification(options: EngineOptions): Promise<VerifyRes
   }
   return {
     attempt: options.attempt,
+    // Vacuous truth by design: with no configured steps nothing required failed, so
+    // `ok` is true. A caller that reads `ok` as "this patch was verified" MUST
+    // therefore refuse an empty step list itself — Task 13's clone_verify does — and
+    // the test below pins this vacuity so it stays a decision rather than a surprise.
     ok: !results.some(result => result.required && !result.ok),
     started_at: startedAt,
     finished_at: now().toISOString(),
@@ -3267,6 +3307,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runPaths } from '../src/core/artifacts.ts'
+import { resolveSettings } from '../src/config.ts'
 import { renderReport, summarizeReport, writeReport, type ReportInput } from '../src/report/report.ts'
 import type { Assessment, Cluster, PatchRecord, VerifyResult } from '../src/core/schema.ts'
 
@@ -3355,6 +3396,25 @@ describe('renderReport', () => {
   it('lists the coverage gaps instead of hiding them', () => {
     const text = renderReport(input())
     expect(text).toMatch(/C002/)
+  })
+
+  it('names the configured steps that did not run, so a skip cannot read as a smaller pipeline', () => {
+    const verify: VerifyResult = {
+      attempt: 1, ok: false, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      rolled_back: false, rollback_files: [],
+      steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln', required: true, always: false, exit_code: 1, ok: false, timed_out: false, log_file: 'D:/runs/run-1/verify/1/1-build.log', lossy: false }],
+    }
+    const withSteps = input({ verify: [verify], assessments: new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]]) })
+    // The run's snapshot is what knows the full configured list; the attempt only has
+    // the steps that executed.
+    withSteps.run.settings = resolveSettings({
+      projectRoot: 'D:/gme',
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }, { name: 'test-debug', phase: 'test', command: 'tests.exe' }] },
+    }).settings
+    const text = renderReport(withSteps)
+    expect(text).toContain('未执行')
+    expect(text).toContain('test-debug')
+    expect(text).toContain('本次共配置 2 步，实际执行 1 步')
   })
 })
 
@@ -3546,6 +3606,18 @@ export function renderReport(input: ReportInput): string {
       lines.push('| 步骤 | 阶段 | 命令 | 退出码 | 结果 | 日志 |', '|---|---|---|---|---|---|')
       for (const step of attempt.steps) {
         lines.push(`| ${step.name} | ${step.phase} | \`${step.command}\` | ${String(step.exit_code)} | ${step.ok ? 'ok' : 'FAIL'} | \`${step.log_file}\` |`)
+      }
+      // The engine returns only the steps it executed, and StepResult has no `skipped`
+      // field, so a reader could not otherwise tell "not configured" from "skipped after
+      // an earlier failure". The run's own settings snapshot carries the configured
+      // list, so the difference is derivable and must be shown — a report that silently
+      // omits a step nobody ran is the same lie as a hidden coverage gap. The defensive
+      // read also survives an older `run.json` whose settings shape predates this field.
+      const ran = new Set(attempt.steps.map(step => step.name))
+      const configured = (input.run.settings?.verify?.steps ?? []).map(step => step.name)
+      const notRun = configured.filter(name => !ran.has(name))
+      if (notRun.length > 0) {
+        lines.push('', `未执行 / not run: ${notRun.map(name => `\`${name}\``).join(', ')} —— 前序必需步骤失败后按规则跳过（本次共配置 ${configured.length} 步，实际执行 ${attempt.steps.length} 步）`)
       }
       if (attempt.rolled_back) lines.push('', `已回滚 / rolled back: ${attempt.rollback_files.map(file => `\`${file}\``).join(', ')}`)
       lines.push('')
@@ -4162,6 +4234,14 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
     async execute(args) {
       const runId = requireText(args.run_id, 'run_id')
       const { paths, record } = await openRun({ settings, runner, artifactsRoot, runId })
+      // An empty step list must never become a vacuous "verified": the engine reports
+      // ok for zero steps (nothing required failed), and clone_submit reads that as a
+      // passing verification. Refuse loudly here, before anything destructive can
+      // follow — the rollback branch below would otherwise delete the patch over a
+      // configuration problem rather than a failing test.
+      if (settings.verify.steps.length === 0) {
+        throw new Error('verify.steps is empty, so nothing can be verified: configure this site\'s build/test steps before running clone_verify. An unverified patch must not be submitted.')
+      }
       const patches = await loadPatches(paths)
       const authorized = [...new Set(patches.flatMap(patch => patch.files_changed.map(normalizeRepoPath)))].sort()
       const status = await runner.run({ argv: ['git', 'status', '--porcelain'], cwd: record.project_root, timeoutMs: 60_000, signal: undefined })
