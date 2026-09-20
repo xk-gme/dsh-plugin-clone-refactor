@@ -686,9 +686,13 @@ describe('the whole chain', () => {
   it('scans, judges every cluster, verifies and reports', async () => {
     const root = await workspace()
     const csv = join(root, 'func_clone_base.csv')
-    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    // TWO disjoint pairs, so the CSV really yields two clusters. A single-cluster
+    // base makes the summary's counting assertions vacuous: `clusters: 1` is what
+    // every wrong aggregation rule returns for a one-element input.
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`
+      + 'p2,module/laws/src/c.cpp,DrawShape,50-60,module/laws/src/d.cpp,PaintShape,70-80,0.88,type12\n')
     const gitAndBuild: Array<[string, { stdout?: string; exitCode?: number }]> = [
-      // 本测试把 C001 判为 `report_only`，因此**不记录任何 patch**：授权账本为空，而
+      // 本测试把两个簇都判为 `report_only`，因此**不记录任何 patch**：授权账本为空，而
       // reconcile 会拿 `[]` 去比 `git diff` 报的东西。GIT_OK 的 diff 回答里有一个文件名，
       // 那会让本测试期望成功的验证步骤先被冻结 —— 所以先报一个干净的工作区（首个前缀匹配
       // 生效，覆盖项必须写在前面）。
@@ -712,22 +716,33 @@ describe('the whole chain', () => {
     expect((scan as { isError?: boolean }).isError).not.toBe(true)
     await settle(ctx, 'r1')
 
+    // Every cluster of the scan needs a verdict: the coverage contract is what
+    // makes `missing: 0` below mean "judged", not "reported anyway".
     const assessed = await call(ctx, 'clone_assess', {
       run_id: 'r1', cluster_id: 'C001', verdict: 'report_only', priority: 'P1',
       reason: 'renaming-only difference, but the callee is virtual',
       evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'virtual void draw();' },
     })
     expect((assessed as { isError?: boolean }).isError).not.toBe(true)
+    expect(rendered(assessed)).toContain('"remaining":1')
+
+    const assessed2 = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C002', verdict: 'report_only', priority: 'P1',
+      reason: 'the two shapes differ, but the base class owns the state both use',
+      evidence: { file: 'module/laws/src/c.cpp', line: 52, snippet: 'void Shape::draw(const Target& t)' },
+    })
+    expect((assessed2 as { isError?: boolean }).isError, rendered(assessed2)).not.toBe(true)
+    expect(rendered(assessed2)).toContain('"remaining":0')
 
     const verify = await call(ctx, 'clone_verify', { run_id: 'r1' })
     expect((verify as { isError?: boolean }).isError).not.toBe(true)
     await settle(ctx, 'r1')
 
     const report = await call(ctx, 'clone_report', { run_id: 'r1' })
-    expect((report as { isError?: boolean }).isError).not.toBe(true)
+    expect((report as { isError?: boolean }).isError, rendered(report)).not.toBe(true)
     const summaryPath = join(root, 'runs', 'r1', 'summary.json')
     const summary = JSON.parse(await readFile(summaryPath, 'utf8')) as { clusters: number; missing: number; verify_ok: boolean }
-    expect(summary.clusters).toBe(1)
+    expect(summary.clusters).toBe(2)
     expect(summary.missing).toBe(0)
     expect(summary.verify_ok).toBe(true)
     expect(await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')).toContain('msbuild tests.sln')
@@ -753,22 +768,28 @@ describe('the whole chain', () => {
       // 遮蔽，测试于是永远看不到这两个"被改动的文件"，冻结逻辑根本不会被触发。
       ['git status --porcelain', { stdout: ' M module/laws/src/a.cpp\n M module/laws/src/sneaky.cpp\n' }],
       ['git diff --name-only', { stdout: 'module/laws/src/a.cpp\nmodule/laws/src/sneaky.cpp\n' }],
-      // `authorization.enabled: true` 会让 openRun 建 run 分支，因此需要一条脚本化的
-      // `git checkout -B`，否则 clone_scan 会在断言之前就因未脚本化的命令而失败。
-      ['git checkout -B', {}],
       ...GIT_OK,
     ]))
     await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
     await settle(ctx, 'r1')
-    await call(ctx, 'clone_assess', {
+    const assessed = await call(ctx, 'clone_assess', {
       run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
       reason: 'body identical, extracted a helper', files_changed: ['module/laws/src/a.cpp'],
       evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'static int area(const Rect& r)' },
       confirm: true,
     })
+    expect((assessed as { isError?: boolean }).isError, rendered(assessed)).not.toBe(true)
+    // "A change outside the ledger" only means something when something is inside
+    // it: with an empty ledger EVERY changed file is unauthorized, and the freeze
+    // below would be indistinguishable from a ledger that never recorded consent.
+    expect(await loadPatchesOf(root)).toHaveLength(1)
     const verify = await call(ctx, 'clone_verify', { run_id: 'r1' })
     expect((verify as { isError?: boolean }).isError).toBe(true)
-    expect(JSON.stringify(verify)).toMatch(/UNAUTHORIZED_CHANGES/)
-    expect(JSON.stringify(verify)).toMatch(/sneaky\.cpp/)
+    // Assert the payload, not the envelope, and name the authorized file too: the
+    // freeze must be about sneaky.cpp, not about the authorized a.cpp.
+    const frozen = rendered(verify)
+    expect(frozen).toMatch(/UNAUTHORIZED_CHANGES/)
+    expect(frozen).toMatch(/sneaky\.cpp/)
+    expect(frozen).not.toMatch(/module\/laws\/src\/a\.cpp/)
   })
 })

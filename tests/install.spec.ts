@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url'
 import jsYaml from 'js-yaml'
 import { Context } from '@deepseek-ai/cordis'
 import Loader, { type EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
-import { applyEntryPatches, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
+import { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt, { type PromptSection } from '@deepseek-ai/dsh-system-prompt'
 import Tools from '@deepseek-ai/dsh-tools'
@@ -48,20 +48,17 @@ function setEnv(key: string, value: string | undefined): void {
   else process.env[key] = value
 }
 
-/** The include's YAML dialect, rebuilt so the committed patch parses here. */
-const JsExpr = new jsYaml.Type('tag:yaml.org,2002:js', {
-  kind: 'scalar',
-  resolve: (data: unknown) => typeof data === 'string',
-  construct: (data: string) => ({ __jsExpr: data }),
-})
-const schema = jsYaml.JSON_SCHEMA.extend(JsExpr)
-
+/**
+ * The committed patch, parsed with the include's OWN exported dialect. A locally
+ * rebuilt schema would be the one piece of this test that could silently drift
+ * from what the Loader actually mounts.
+ */
 async function patchText(): Promise<string> {
   return await readFile(join(ROOT, 'cordis.patch.yml'), 'utf8')
 }
 
 async function patchRows(): Promise<PatchOptions[]> {
-  const parsed = jsYaml.load(await patchText(), { schema })
+  const parsed = jsYaml.load(await patchText(), { schema: entryListSchema })
   if (!Array.isArray(parsed)) throw new Error('the bundle patch must be a top-level array')
   return parsed as PatchOptions[]
 }
@@ -146,8 +143,13 @@ describe('a freshly installed, unconfigured row', () => {
     setEnv(ROOT_ENV, undefined)
     const { ctx, imported, sections, warnings } = await mount(await insertedRow())
     expect(imported).toEqual([PACKAGE_NAME])
-    // "No tools" is the contract, so the call must miss the registry entirely
-    // rather than reach a clone-refactor body that happens to refuse this input.
+    // Spec §16 criterion 1 is "registers NO tools", so assert the registry itself
+    // and then the package's own names in the form the configured case uses. A
+    // row that registered exactly one tool would satisfy neither.
+    expect(ctx.tools.schemas()).toEqual([])
+    expect(TOOLS.filter(tool => ctx.tools.get(tool) !== undefined)).toEqual([])
+    // The call path must miss the registry entirely too, rather than reach a
+    // clone-refactor body that happens to refuse this input.
     const checked = await call(ctx, 'clone_check', { run_id: 'r1', what: 'status' })
     expect(checked.isError).toBe(true)
     expect(JSON.stringify(checked)).toMatch(/UNKNOWN_TOOL/)
