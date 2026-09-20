@@ -3289,6 +3289,16 @@ git commit -m "feat(core): persist background job records for polling after a re
 
 ### Task 11: 报告（report.md / findings.json / summary.json）
 
+> **实现的最终形态是 `b366a19`（Task 11 修复轮），比下面的清单多出五项。** 每一顶都是 spec 或本节散文已经要求的行为，不是新功能，因此不逐字回写代码块 —— 转写一份已被实现取代的清单没有决策价值，而"回写计划使其与产物一致"恰恰会毁掉计划作为交叉校验的价值（见 ledger R41）。五项是：
+>
+> 1. **`cell()` 单元格净化**：`|` 转义为 `\|`、换行折叠为空格，作用于簇表与验证表的**每个**插值单元格。否则模型写的 `reason` 或操作者写的 `command` 里一个 `|`/`||` 就会**静默错位证据表**（错位后仍看起来像表格，比缺一列更糟）。
+> 2. **`verify_ok` 取最新一次尝试**，与 `clone_submit` 的口径一致。原清单要求"每次尝试都通过"，于是在计划自己设计的"FAIL → 修 → PASS"重试之后，报告会对一个工具已接受的补丁打出"不得提交"的假结论。
+> 3. **越界优先级的 catch-all 分组** `其他优先级 / other priority`，并在概览与 `summary.json` 中同样可见。原清单下，一个优先级不在 `PRIORITIES` 内的判定**不属于任何分组也不是缺口**，于是该簇从表里消失，而 `recorded` 仍计它、`missing` 仍为 0。
+> 4. **概览与 `summary.json` 的分优先级计数**（spec §11 第 1 项、§5）。
+> 5. **失败且未回滚时输出 `未回滚 / not rolled back: <原因>`**（基线不干净优先，其次 `verify.keepFailedPatch`），以及证据单元格的**行与片段**（spec §11 第 2 项、§15）。原清单只在 `rolled_back === true` 时输出，于是"压根没考虑回滚"与"我们决定不回滚"读起来一样。
+>
+> 最终审查应以 spec、本注与 `b366a19` 为准，而**不是**以下面的清单为准。
+
 **Files:**
 - Create: `src/report/report.ts`, `src/report/summary.ts`
 - Test: `tests/report.spec.ts`
@@ -3581,7 +3591,7 @@ function clusterLine(cluster: Cluster, assessment: Assessment | undefined): stri
   const priority = assessment?.priority ?? '-'
   const reason = assessment?.reason ?? 'no verdict recorded'
   const pair = cluster.representative
-  return `| ${cluster.id} | ${priority} | ${verdict} | ${cluster.size} | \`${pair.left.file}\` ↔ \`${pair.right.file}\` | ${reason} |`
+  return `| \`${cluster.id}\` | ${priority} | ${verdict} | ${cluster.size} | \`${pair.left.file}\` ↔ \`${pair.right.file}\` | ${reason} |`
 }
 
 /** Render the human report. Pure: the same input always yields the same text. */
