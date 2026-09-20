@@ -3895,7 +3895,18 @@ export interface SubmitResult {
 
 /** Expand `{name}` placeholders; an unknown name is left visible, never blanked. */
 export function renderCommitMessage(template: string, values: Record<string, string>): string {
-  return template.replaceAll(/\{(\w+)\}/g, (match, name: string) => (Object.hasOwn(values, name) ? values[name] : match))
+  // `Object.hasOwn` is NOT a type guard for `Record<string, string>`, so the one-line
+  // form `Object.hasOwn(values, name) ? values[name] : match` fails `tsc` with TS2769
+  // — the index read stays `string | undefined` while the replacer must return
+  // `string`. Bind first, then guard, then narrow.
+  // The trap this hides: `pnpm vitest run tests/submit.spec.ts` reports **green** on
+  // the non-compiling form, because Vite transpiles without typechecking. Only
+  // `pnpm run verify` (tsc) catches it — which is one more reason R19 runs the full
+  // gate rather than the focused test.
+  return template.replaceAll(/\{(\w+)\}/g, (match, name: string) => {
+    const value: string | undefined = values[name]
+    return Object.hasOwn(values, name) && value !== undefined ? value : match
+  })
 }
 
 async function run(input: SubmitInput, argv: readonly string[], steps: string[]): Promise<string> {
