@@ -30,9 +30,19 @@ export interface SubmitResult {
   steps: string[]
 }
 
-/** Expand `{name}` placeholders; an unknown name is left visible, never blanked. */
+/**
+ * Expand `{name}` placeholders; an unknown name is left visible, never blanked.
+ *
+ * `values` is an ordinary object, so a bare `values[name]` reads the prototype
+ * chain: `{constructor}` would render `function Object() { [native code] }` and
+ * `{__proto__}` would render `[object Object]` into a user's commit message.
+ * `Object.hasOwn` is what makes "unknown" mean "not supplied by the caller".
+ */
 export function renderCommitMessage(template: string, values: Record<string, string>): string {
-  return template.replaceAll(/\{(\w+)\}/g, (match, name: string) => values[name] ?? match)
+  return template.replaceAll(/\{(\w+)\}/g, (match, name: string) => {
+    const value: string | undefined = values[name]
+    return Object.hasOwn(values, name) && value !== undefined ? value : match
+  })
 }
 
 async function run(input: SubmitInput, argv: readonly string[], steps: string[]): Promise<string> {
