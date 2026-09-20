@@ -2726,7 +2726,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runPaths } from '../src/core/artifacts.ts'
-import { runVerification } from '../src/verify/engine.ts'
+import { runVerification, splitCommand } from '../src/verify/engine.ts'
 import type { VerifyStep } from '../src/config.ts'
 import { fakeRunner } from './fixtures/fake-runner.ts'
 
@@ -2819,6 +2819,33 @@ describe('runVerification', () => {
     const runner = fakeRunner([['msbuild', {}]])
     await runVerification({ runner, paths: target, attempt: 1, cwd: 'D:/repo', signal: undefined, steps: [step('build', 'msbuild x.sln')] })
     expect(runner.calls[0]?.cwd).toBe('D:/repo')
+  })
+})
+
+describe('splitCommand', () => {
+  // This is the function that turns a configured command *string* into argv, so a
+  // quoting bug here silently mis-invokes the build rather than failing loudly.
+  it('splits on spaces and tabs and collapses runs of them', () => {
+    expect(splitCommand('msbuild tests.sln /p:Configuration=Debug')).toEqual(['msbuild', 'tests.sln', '/p:Configuration=Debug'])
+    expect(splitCommand('a\t\tb   c')).toEqual(['a', 'b', 'c'])
+  })
+
+  it('keeps a quoted segment together, which is the normal case for a Windows path', () => {
+    expect(splitCommand('"C:\\Program Files\\msbuild.exe" /p:Configuration=Debug'))
+      .toEqual(['C:\\Program Files\\msbuild.exe', '/p:Configuration=Debug'])
+    expect(splitCommand("clang-format -i 'my file.cpp'")).toEqual(['clang-format', '-i', 'my file.cpp'])
+  })
+
+  it('returns nothing for an empty or blank command instead of one empty argument', () => {
+    expect(splitCommand('')).toEqual([])
+    expect(splitCommand('   ')).toEqual([])
+  })
+
+  it('pins the limitation: an opening quote with no close still yields the token', () => {
+    // Not an escape-aware splitter: there is no way to embed a literal quote, and an
+    // unterminated quote simply ends at the string's end. Pinned so a later change to
+    // either behaviour is a deliberate one.
+    expect(splitCommand('"unterminated')).toEqual(['unterminated'])
   })
 })
 ```
@@ -4855,6 +4882,7 @@ needs a Python checkout with libclang and, for type 3-4, an embeddings endpoint.
 另有两项**必须**写进使用文档，它们是设计里明确的边界而不是待办：
 
 - **运行范围**：`projectRoot` 必须是跟踪本次目标文件的**那个** git 仓库。目标在子模块内（如 `module/laws/**`）时指向该子模块本身；跨 superproject + submodule 的单次运行不在本期范围。写清"为什么"：主工程的 `git ls-files` / `status` / `diff` 看不到子模块内的文件，会直接导致授权对账判为未授权、分区回滚误判为"本次新建"。
+- **凭据暴露面（R34）**：embedding key 是**以命令行参数**传给检测脚本的（脚本只认 `--embedding-commercial-api-key`，且命令执行接口不传环境变量）。因此一个会回显自身 argv 的管线可能把 key 写到比插件所控制的更广的地方：插件的 run 日志已脱敏，但**宿主在输出被截断时落盘的 spill 文件**在 run 目录之外，插件既读不到也脱不了敏。文档要如实写明这条**残留暴露面**，让操作者据此判断 run 目录与其周边产物能否外发。
 - **回滚语义**：验证失败且 `verify.keepFailedPatch` 为假、**且基线干净**时，插件分区回滚 —— 被跟踪的文件恢复到基线，**本次新建的文件会被删除**；任一步失败会抛错并体现在 job 记录与报告中，不会出现"报告说回滚了、实际没回滚"。**开了 `workdir.allowDirty: true` 时不自动回滚**：操作者手上本来就有未提交的工作，恢复或删除都会毁掉它；此时只记录失败并把工作区原样留给他处理。
 
 首次自用的实测清单（必须照实写进文档，因为 GME 的构建命令在本计划中未经验证）：
