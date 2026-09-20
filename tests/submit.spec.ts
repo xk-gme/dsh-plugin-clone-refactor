@@ -159,6 +159,25 @@ describe('submit', () => {
     await expect(submit({ ...BASE, runner, mode: 'pr' })).rejects.toThrow(/git add/)
   })
 
+  it('tells the operator that a timed-out outward command may still have landed', async () => {
+    // `{ exitCode: 0, timedOut: true }` means the child finished as our deadline fired
+    // (see the comment on `assertCompleted`), so for `git commit`, `git push` and
+    // `gh pr create` the action MAY have happened. The refusal said only "cut off by
+    // its timeout", which reads as "nothing happened" — an operator who retries then
+    // gets a second commit or a rejected push and has to work out why. Every other
+    // gate refusal in this codebase names the next step.
+    const stalled = (prefix: string, stdout = ''): FakeScriptEntry => [prefix, { stdout, exitCode: 0, timedOut: true }]
+    const runner = fakeRunner([ON_RUN_BRANCH, stalled('git add'), stalled('git commit')])
+    const error = await submit({ ...BASE, runner, mode: 'commit' }).then(
+      () => undefined,
+      (reason: unknown) => reason as Error,
+    )
+    expect(error?.message).toMatch(/may still have taken effect/)
+    expect(error?.message).toMatch(/git log/)
+    expect(error?.message).toMatch(/git ls-remote/)
+    expect(error?.message).toMatch(/nothing was reported as done/)
+  })
+
   it('commits on the run branch, not on whatever branch HEAD drifts to', async () => {
     // A manual branch switch between verify and submit would commit the patch on
     // the wrong branch while `git push origin <run branch>` pushes a stale ref.

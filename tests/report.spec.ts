@@ -6,7 +6,7 @@ import { runPaths } from '../src/core/artifacts.ts'
 import type { JobRecord } from '../src/core/jobs.ts'
 import { resolveSettings } from '../src/config.ts'
 import { renderReport, summarizeReport, writeReport, type ReportInput } from '../src/report/report.ts'
-import type { Assessment, Cluster, PatchRecord, VerifyResult } from '../src/core/schema.ts'
+import type { Assessment, Cluster, PatchRecord, ReconcileAudit, VerifyResult } from '../src/core/schema.ts'
 
 const cleanups: Array<() => Promise<unknown>> = []
 afterEach(async () => { while (cleanups.length) await cleanups.pop()!() })
@@ -40,6 +40,23 @@ function assessment(clusterId: string, verdict: Assessment['verdict']): Assessme
   return { cluster_id: clusterId, verdict, priority: 'P0', reason: 'same body, no API change', files_changed: verdict === 'patched' ? ['module/laws/src/a.cpp'] : [], recorded_at: '2026-09-20T00:00:00.000Z' }
 }
 
+/** One attempt's reconcile record: shaped, and about the ledger the fixture patches. */
+function audit(): ReconcileAudit {
+  return {
+    authorized: ['module/laws/src/a.cpp'], changed: ['module/laws/src/a.cpp'], unauthorized: [], missing: [],
+    cluster_ids: ['C001'], scan_revision: 'rev-1', recorded_at: '2026-09-20T00:00:00.000Z',
+  }
+}
+
+/** The newest VERIFY job record, on its own path from `result.json`. */
+function verifyJob(status: JobRecord['status']): JobRecord {
+  return {
+    job_id: 'verify-20260920-000000-aaaa', run_id: 'run-1', kind: 'verify', status,
+    started_at: '2026-09-20T00:00:00.000Z', finished_at: status === 'running' ? null : '2026-09-20T00:10:00.000Z',
+    error: null, summary: '',
+  }
+}
+
 function input(overrides: Partial<ReportInput> = {}): ReportInput {
   return {
     run: {
@@ -52,6 +69,13 @@ function input(overrides: Partial<ReportInput> = {}): ReportInput {
     assessments: new Map([['C001', assessment('C001', 'patched')]]),
     patches: [{ cluster_id: 'C001', priority: 'P0', files_changed: ['module/laws/src/a.cpp'], recorded_at: '2026-09-20T00:00:00.000Z' }] as PatchRecord[],
     verify: [],
+    // The default state is "no verification was ever attempted": no attempt
+    // directory, no verify job and no reconcile record. A test that supplies an
+    // attempt states all three, because the summary's verdict is the submit gate's
+    // and those are the gate's own inputs.
+    newestAttempt: undefined,
+    verifyJob: undefined,
+    audit: undefined,
     job: undefined,
     droppedLines: [],
     unauthorized: [],
@@ -86,7 +110,11 @@ describe('renderReport', () => {
       rolled_back: false, rollback_files: [],
       steps: [{ name: 'build', phase: 'build', command: 'msbuild x.sln', required: true, always: false, exit_code: 0, ok: true, timed_out: false, log_file: 'D:/runs/run-1/verify/1/1-build.log', lossy: false }],
     }
-    const text = renderReport(input({ verify: [verify], assessments: new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]]) }))
+    const text = renderReport(input({
+      verify: [verify],
+      newestAttempt: 1, verifyJob: verifyJob('succeeded'), audit: audit(),
+      assessments: new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]]),
+    }))
     expect(text).toContain('run-1')
     expect(text).toContain('abc123')
     expect(text).toContain('csv')
@@ -133,15 +161,62 @@ describe('renderReport', () => {
     // The sequence the plan is built around: attempt 1 fails, the patch is fixed, attempt 2
     // passes. A submit gate reads the newest attempt, so the closing report must too, or it
     // tells a human not to commit work the tooling accepts.
-    const recovered = input({ verify: [outcome(1, false), outcome(2, true)], assessments: complete })
+    const recovered = input({
+      verify: [outcome(1, false), outcome(2, true)], assessments: complete,
+      newestAttempt: 2, verifyJob: verifyJob('succeeded'), audit: audit(),
+    })
     expect(summarizeReport(recovered).verify_ok).toBe(true)
     expect(renderReport(recovered)).toContain('验证 attempts: 2（最新一次 ok: true）')
     expect(renderReport(recovered)).not.toContain('有已 patch 的簇没有通过的验证')
     // The other direction: a pass that a later failing attempt broke is not a pass, so
     // "newest" cannot be satisfied by "some attempt passed".
-    const regressed = input({ verify: [outcome(1, true), outcome(2, false)], assessments: complete })
+    const regressed = input({
+      verify: [outcome(1, true), outcome(2, false)], assessments: complete,
+      newestAttempt: 2, verifyJob: verifyJob('failed'), audit: audit(),
+    })
     expect(summarizeReport(regressed).verify_ok).toBe(false)
     expect(renderReport(regressed)).toContain('有已 patch 的簇没有通过的验证')
+  })
+
+  it('does not call a run verified when the newest attempt has no result at all', () => {
+    // Attempt 1 recorded a passing result.json; attempt 2 wrote its reconcile.json and
+    // then never produced a result (frozen before the job started, or killed mid-build).
+    // `loadVerifyAttempts` can only return the attempts it can READ, so a verdict built
+    // from that list alone said "verify_attempts: 1, verify_ok: true" about a run whose
+    // newest verification has no outcome — while the submit gate, reading the attempt
+    // DIRECTORY, refuses it. The two artefacts a human and a machine trust were the
+    // wrong ones.
+    const complete = new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]])
+    const outcome = (attempt: number, ok: boolean): VerifyResult => ({
+      attempt, ok, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      rolled_back: false, rollback_files: [], steps: [],
+    })
+    const newestHasNoResult = input({
+      verify: [outcome(1, true)], assessments: complete,
+      newestAttempt: 2, verifyJob: verifyJob('succeeded'), audit: audit(),
+    })
+    expect(summarizeReport(newestHasNoResult).verify_ok).toBe(false)
+    expect(summarizeReport(newestHasNoResult).unverified).toBe(true)
+    expect(renderReport(newestHasNoResult)).toContain('有已 patch 的簇没有通过的验证')
+
+    // The no-newer-attempt case is a pass: the same three inputs, with the newest
+    // attempt being the one that passed and settled.
+    const settled = input({
+      verify: [outcome(1, true)], assessments: complete,
+      newestAttempt: 1, verifyJob: verifyJob('succeeded'), audit: audit(),
+    })
+    expect(summarizeReport(settled).verify_ok).toBe(true)
+    expect(summarizeReport(settled).unverified).toBe(false)
+    expect(renderReport(settled)).not.toContain('有已 patch 的簇没有通过的验证')
+
+    // And an unreadable reconcile record is not a pass either: "cannot be shown" must
+    // never read as "verified".
+    const noReconcile = input({
+      verify: [outcome(1, true)], assessments: complete,
+      newestAttempt: 1, verifyJob: verifyJob('succeeded'), audit: undefined,
+    })
+    expect(summarizeReport(noReconcile).verify_ok).toBe(false)
+    expect(summarizeReport(noReconcile).unverified).toBe(true)
   })
 
   it('keeps a row intact when a reason carries a pipe or a newline', () => {
@@ -172,6 +247,7 @@ describe('renderReport', () => {
     }
     const text = renderReport(input({
       verify: [verify],
+      newestAttempt: 1, verifyJob: verifyJob('failed'), audit: audit(),
       assessments: new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]]),
     }))
     const lines = text.split('\n')

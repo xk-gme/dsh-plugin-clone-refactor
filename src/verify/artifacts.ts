@@ -139,6 +139,16 @@ export interface UnauthorizedStatus extends UnauthorizedRead {
   newestAttempt: number | undefined
   /** The newest attempt whose reconcile record is readable. */
   reconciledAttempt: number | undefined
+  /**
+   * The newest attempt's OWN readable reconcile audit, when it recorded one.
+   *
+   * The freeze claim above is derived from it, and it is also the third record the
+   * submit gate reads (`src/verify/gate.ts`). `clone_report` needs that same record —
+   * the gate's verdict is what `summary.json` publishes as `verify_ok` — so one read
+   * of the attempt directory serves both rather than a second read that could name a
+   * damaged file twice.
+   */
+  newestAudit: ReconcileAudit | undefined
 }
 
 /**
@@ -175,6 +185,7 @@ export async function loadUnauthorized(paths: RunPaths, onUnreadable?: Unreadabl
     ...unauthorizedClaim(audits, newestAttempt),
     newestAttempt,
     reconciledAttempt: [...audits.keys()].sort((left, right) => left - right).at(-1),
+    newestAudit: newestAttempt === undefined ? undefined : audits.get(newestAttempt),
   }
 }
 

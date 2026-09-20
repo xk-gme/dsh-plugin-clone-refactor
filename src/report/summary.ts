@@ -1,11 +1,22 @@
 /** The machine-readable counts: what a caller checks without parsing Markdown. */
-import type { Assessment, Cluster, PatchRecord, VerifyResult } from '../core/schema.ts'
+import type { JobRecord } from '../core/jobs.ts'
+import type { Assessment, Cluster, PatchRecord, ReconcileAudit, VerifyResult } from '../core/schema.ts'
+import { newestVerifyOutcome } from '../verify/gate.ts'
 
 export interface SummaryInput {
   clusters: readonly Cluster[]
   assessments: ReadonlyMap<string, Assessment>
   patches: readonly PatchRecord[]
   verify: readonly VerifyResult[]
+  /**
+   * The submit gate's own inputs for the newest attempt: its DIRECTORY number, the
+   * newest verify job record and that attempt's reconcile audit. The verdict below
+   * is computed from these three, so a summary cannot call a run verified while the
+   * gate refuses it.
+   */
+  newestAttempt: number | undefined
+  verifyJob: JobRecord | undefined
+  audit: ReconcileAudit | undefined
 }
 
 export interface Summary {
@@ -19,7 +30,16 @@ export interface Summary {
   by_priority: Record<string, number>
   authorized_files: number
   verify_attempts: number
-  /** Whether the NEWEST attempt passed: the same attempt a submit gate reads. */
+  /**
+   * Whether the NEWEST attempt settled as a pass, by the submit gate's own
+   * definition (`newestVerifyOutcome`): the newest attempt DIRECTORY has a readable
+   * ok result, its verify JOB succeeded, and its reconcile audit is readable.
+   *
+   * Not "the newest readable `result.json`", which is not the attempt a gate reads:
+   * an attempt killed or frozen before its result landed left no result.json for
+   * `loadVerifyAttempts` to return, and a verdict built from that list alone said
+   * `verify_ok: true` about a run whose newest verification has no outcome at all.
+   */
   verify_ok: boolean
 }
 
@@ -36,10 +56,13 @@ export function countByPriority(clusters: readonly Cluster[], assessments: Reado
 
 export function summarize(input: SummaryInput): Summary {
   const verdicts = [...input.assessments.values()]
-  // The newest attempt is the one a submit gate reads. Attempt 1 failing and attempt 2
-  // passing is a verified patch, and a report that said otherwise would tell a human
-  // not to commit work the tooling accepts.
-  const newest = input.verify.at(-1)
+  // The newest attempt is the one a submit gate reads, so its verdict is the gate's:
+  // attempt 1 failing and attempt 2 passing is a verified patch, a report that said
+  // otherwise would tell a human not to commit work the tooling accepts — and the
+  // mirror image (attempt 2 never wrote a result) is not a pass.
+  const newest = newestVerifyOutcome({
+    attempts: input.verify, newestAttempt: input.newestAttempt, verifyJob: input.verifyJob, audit: input.audit,
+  })
   return {
     clusters: input.clusters.length,
     recorded: input.clusters.filter(cluster => input.assessments.has(cluster.id)).length,
@@ -50,6 +73,6 @@ export function summarize(input: SummaryInput): Summary {
     by_priority: countByPriority(input.clusters, input.assessments),
     authorized_files: new Set(input.patches.flatMap(patch => patch.files_changed)).size,
     verify_attempts: input.verify.length,
-    verify_ok: newest !== undefined && newest.ok,
+    verify_ok: newest.settled,
   }
 }

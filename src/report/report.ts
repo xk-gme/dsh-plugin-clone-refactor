@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto'
 import { writeAtomic, type RunPaths } from '../core/artifacts.ts'
 import { PRIORITIES } from '../config.ts'
-import type { Assessment, ClonePair, ClonePairSide, Cluster, PatchRecord, VerifyResult } from '../core/schema.ts'
+import type { Assessment, ClonePair, ClonePairSide, Cluster, PatchRecord, ReconcileAudit, VerifyResult } from '../core/schema.ts'
 import type { RunRecord } from '../core/run.ts'
 import type { JobRecord } from '../core/jobs.ts'
 import { coverageGaps } from '../core/ledger.ts'
@@ -22,6 +22,16 @@ export interface ReportInput {
   assessments: ReadonlyMap<string, Assessment>
   patches: readonly PatchRecord[]
   verify: readonly VerifyResult[]
+  /**
+   * The submit gate's own inputs for the newest attempt — its DIRECTORY number, the
+   * newest VERIFY job record and that attempt's reconcile audit. Required, not
+   * optional: a summary whose `verify_ok` is computed from a different set of facts
+   * than the gate reads is how `summary.json` came to say `verify_ok: true` about a
+   * run `clone_submit` refuses (see `newestVerifyOutcome`).
+   */
+  newestAttempt: number | undefined
+  verifyJob: JobRecord | undefined
+  audit: ReconcileAudit | undefined
   job: JobRecord | undefined
   droppedLines: readonly number[]
   /**
@@ -66,7 +76,10 @@ export interface ReportSummary extends Summary {
 
 /** The counts that go into summary.json, including what could NOT be confirmed. */
 export function summarizeReport(input: ReportInput): ReportSummary {
-  const base = summarize({ clusters: input.clusters, assessments: input.assessments, patches: input.patches, verify: input.verify })
+  const base = summarize({
+    clusters: input.clusters, assessments: input.assessments, patches: input.patches, verify: input.verify,
+    newestAttempt: input.newestAttempt, verifyJob: input.verifyJob, audit: input.audit,
+  })
   return {
     ...base,
     run_id: input.run.run_id,

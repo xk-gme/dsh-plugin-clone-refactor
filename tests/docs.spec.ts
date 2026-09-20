@@ -234,6 +234,26 @@ describe('the configuration reference in the two setup docs', () => {
   })
 })
 
+describe('the clone_check row in the two setup docs', () => {
+  it('names the record fields `clone_check` with what: status really returns', async () => {
+    // The row described the newest job "plus any job records it could not read" without
+    // naming the fields, so when `clone_check` began returning `unreadable_attempts` as
+    // well — the verification records the same poll skips and names — the documented
+    // result was quietly missing it. Both docs carry the row; both have to say so.
+    for (const file of ['docs/setup.md', 'docs/setup.zh.md']) {
+      const row = (await readFile(join(ROOT, file), 'utf8')).split('\n')
+        .find(line => /^\|\s*2\s*\|\s*`clone_check`\s*\|/.test(line)) ?? ''
+      expect(row, `${file} has no clone_check row`).not.toBe('')
+      // The newer field first: this is the one the row did not describe at all.
+      expect(row, `${file}'s clone_check row must name unreadable_attempts`).toContain('unreadable_attempts')
+      // And the row's older half is about job records it could not read, which the
+      // result names too — prose that says "some records could not be read" without
+      // the field is how the attempts half went missing in the first place.
+      expect(row, `${file}'s clone_check row must name unreadable_jobs`).toContain('unreadable_jobs')
+    }
+  })
+})
+
 describe('the artifact field lists in the two setup docs', () => {
   /**
    * The section-6 row that describes one artifact, or `''` when the doc has none —
@@ -270,7 +290,11 @@ describe('the artifact field lists in the two setup docs', () => {
         created_at: '2026-09-20T00:00:00.000Z', updated_at: '2026-09-20T00:00:00.000Z',
         settings: resolveSettings({}).settings,
       },
-      clusters: [], assessments: new Map(), patches: [], verify: [], job: undefined,
+      clusters: [], assessments: new Map(), patches: [], verify: [],
+      // The submit gate's inputs for the newest attempt: this run has none, so
+      // `verify_ok` is false rather than unstated.
+      newestAttempt: undefined, verifyJob: undefined, audit: undefined,
+      job: undefined,
       droppedLines: [], unauthorized: [], resolvedUnauthorized: [],
       unreadableRecords: [], missingReconcileAttempt: undefined,
       notes: '', allowPartial: false, language: 'zh',

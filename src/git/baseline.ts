@@ -97,11 +97,18 @@ function assertTrustworthy(result: CommandResult, context: string): void {
  * `detail` verbatim would put the key into the thrown error and every log of it.
  * Such a caller must ask this guard only for its timeout verdict and rebuild its own
  * refusal from the redacted detail — `src/detect/python.ts` is the pattern.
+ *
+ * The timeout branch therefore takes an optional, CALLER-SUPPLIED `remedy`: what to
+ * do about a command that may have run to completion anyway. It is plain text from
+ * the caller and never captured output, which is why the one caller whose leftovers
+ * are outward actions (`submit.ts`: a commit or a push that may have landed) can
+ * state what to check, while the detection child keeps its redacted rebuild.
  */
-export function assertCompleted(result: CommandResult, context: string): void {
+export function assertCompleted(result: CommandResult, context: string, remedy?: string): void {
   if (result.exitCode === 0 && !result.timedOut) return
   if (result.timedOut) {
-    throw new Error(`${context}: the command was cut off by its timeout (exit ${String(result.exitCode)})`)
+    const advice = remedy === undefined ? '' : ` ${remedy}`
+    throw new Error(`${context}: the command was cut off by its timeout (exit ${String(result.exitCode)})${advice}`)
   }
   throw new Error(`${context}: ${detail(result)}`)
 }

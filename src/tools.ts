@@ -233,7 +233,7 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       reason: { type: 'string', required: true, description: 'Why this verdict: the concrete blocker, or what the patch preserved.' },
       evidence: EVIDENCE,
       files_changed: { type: 'array', items: { type: 'string' }, description: 'Repo-relative files this patch touched; required for patched.' },
-      replace: { type: 'boolean', description: 'Overwrite an earlier verdict for this cluster.' },
+      replace: { type: 'boolean', description: 'Overwrite a verdict this cluster already has under the CURRENT scan revision. A verdict from before a refresh no longer covers the new cluster set, so re-recording it after a refresh needs no replace.' },
       confirm: { type: 'boolean', description: 'Required for a patched verdict: the user explicitly agreed to this source change.' },
     },
     output: output({ type: 'object', additionalProperties: false, properties: {
@@ -377,7 +377,19 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         recorded_at: reconciledAt,
       }, null, 2)}\n`)
       if (audit.unauthorized.length > 0) {
-        throw new Error(`UNAUTHORIZED_CHANGES: ${audit.unauthorized.join(', ')} changed but is not in the authorization ledger. This run is frozen: resolve or revert those files before verifying or submitting.`)
+        // Which of these the run's OWN ledger authorized — under an earlier scan
+        // revision. The freeze is right either way (the current revision authorizes
+        // nothing here), but the remedy is not: telling an operator to revert a file
+        // the user authorized is telling them to undo consented work, and it hides the
+        // one call that resolves it. `patches` above is filtered to the current
+        // revision by design, so this second read is the whole ledger.
+        const everAuthorized = new Set((await loadPatches(paths)).flatMap(patch => patch.files_changed.map(normalizePath)))
+        const stale = audit.unauthorized.filter(file => everAuthorized.has(file))
+        const fresh = audit.unauthorized.filter(file => !everAuthorized.has(file))
+        const staleNote = stale.length === 0 ? '' : ` ${stale.join(', ')} ${stale.length === 1 ? 'is' : 'are'} still authorized under an EARLIER scan revision,`
+          + ' which no longer counts after a refresh: re-assess the cluster with clone_assess to record it under the current revision, instead of reverting a file the run\'s own ledger authorized.'
+        const freshNote = fresh.length === 0 ? '' : ` Revert ${fresh.join(', ')} or record a patched verdict that lists ${fresh.length === 1 ? 'it' : 'them'}.`
+        throw new Error(`UNAUTHORIZED_CHANGES: ${audit.unauthorized.join(', ')} changed but is not in the authorization ledger. This run is frozen: resolve each file before verifying or submitting.${staleNote}${freshNote}`)
       }
       const job = await startJob(paths, runId, 'verify')
       detach(paths, job, async () => {
@@ -505,13 +517,21 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       }
       const verify = await loadVerifyAttempts(paths, noteUnreadable)
       const job = await latestJob(paths, noteUnreadable)
+      // The newest VERIFY job record, not `job`: the two are written on the same
+      // separate path but of different kinds, and a scan that settled after the
+      // verification says nothing about whether the verification did.
+      const verifyJob = await latestVerifyJob(paths, noteUnreadable)
       // The freeze claim is the newest attempt's, the same one the submit gate reads —
       // not the union of every attempt, which made a finished run read as frozen.
       // `newestAttempt` and `reconciledAttempt` are what let the report say "there is
-      // no newest reconcile" instead of printing an unbacked "not frozen".
+      // no newest reconcile" instead of printing an unbacked "not frozen", and
+      // `newestAudit` is that same record, which the summary's `verify_ok` is
+      // computed from: the gate's verdict, not a second opinion about it.
       const unauthorized = await loadUnauthorized(paths, noteUnreadable)
       const written = await writeReport(paths, {
-        run: record, clusters, assessments: latest, patches, verify, job, droppedLines,
+        run: record, clusters, assessments: latest, patches, verify,
+        newestAttempt: unauthorized.newestAttempt, verifyJob, audit: unauthorized.newestAudit,
+        job, droppedLines,
         unauthorized: unauthorized.files,
         resolvedUnauthorized: unauthorized.resolved,
         missingReconcileAttempt: unauthorized.newestAttempt !== undefined && unauthorized.newestAttempt !== unauthorized.reconciledAttempt

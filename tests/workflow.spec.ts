@@ -554,6 +554,159 @@ describe('a refresh rescan cannot reuse an earlier revision\'s verdicts', () => 
     const summary = JSON.parse(rendered(await call(ctx, 'clone_check', { run_id: 'r1', what: 'ledger' }))) as { assessments: unknown[] }
     expect(summary.assessments).toEqual([])
   })
+
+  it('lets a plain clone_assess re-record a cluster whose members the refresh changed', async () => {
+    // The documented recovery: `clone_check what: clusters` reports the gap, and one
+    // plain `clone_assess` closes it. The verdict was refused as "already has a
+    // verdict" — a duplicate of a verdict the coverage contract had already stopped
+    // counting — so the tool sent the model in a circle: refuse, then report the gap
+    // the refusal prevented it from closing.
+    const root = await workspace()
+    const csvA = join(root, 'func_clone_base.csv')
+    const csvB = join(root, 'func_clone_base_v2.csv')
+    await writeFile(csvA, `${CSV_HEADER}p1,a.cpp,f,1-2,b.cpp,g,3-4,0.9,type12\n`)
+    await writeFile(csvB, `${CSV_HEADER}p9,x.cpp,f,1-2,y.cpp,g,3-4,0.9,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csvA },
+    }, fakeRunner(GIT_OK))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    await call(ctx, 'clone_assess', { run_id: 'r1', cluster_id: 'C001', verdict: 'skipped', priority: 'PX', reason: 'the old family is out of scope' })
+
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base', csv_path: csvB, refresh: true })
+    await settle(ctx, 'r1')
+
+    // Plain, no `replace`: the stale verdict is not a duplicate of one about the new
+    // cluster set, and C001 must be re-judged rather than re-covered.
+    const reAssessed = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'skipped', priority: 'PX', reason: 'the new family is a different algorithm',
+    })
+    expect((reAssessed as { isError?: boolean }).isError, rendered(reAssessed)).not.toBe(true)
+    expect((JSON.parse(rendered(reAssessed)) as { remaining: number }).remaining).toBe(0)
+
+    // Coverage is real: the closing report now has no refusal to make.
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError, rendered(reported)).not.toBe(true)
+
+    // The other direction is unchanged: a second verdict under the SAME revision is a
+    // genuine duplicate and still needs `replace: true`, so the model cannot retract
+    // a recorded verdict by accident.
+    const duplicate = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'report_only', priority: 'P1', reason: 'second thoughts', evidence: { file: 'x.cpp', line: 1, snippet: 'x' },
+    })
+    expect((duplicate as { isError?: boolean }).isError, rendered(duplicate)).toBe(true)
+    expect(rendered(duplicate)).toMatch(/already has a verdict/)
+    expect(rendered(duplicate)).toMatch(/replace: true/)
+  })
+
+  it('refreshes, re-assesses every cluster, verifies and submits end to end', async () => {
+    // The acceptance as a chain, not as three unit facts: after a refresh that
+    // renumbered C001 onto a different family, the plain re-assess re-authorizes the
+    // file under the NEW revision, the build passes, and the submission commits it.
+    const root = await workspace()
+    const csvA = join(root, 'func_clone_base.csv')
+    const csvB = join(root, 'func_clone_base_v2.csv')
+    const PATCHED = 'module/laws/src/a.cpp'
+    await writeFile(csvA, `${CSV_HEADER}p1,${PATCHED},ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    await writeFile(csvB, `${CSV_HEADER}p9,${PATCHED},ComputeArea,10-20,module/laws/src/c.cpp,CalcArea,30-40,0.95,type12\n`)
+    const runner = fakeRunner([
+      ['git checkout -B', { stdout: '' }],
+      ['git rev-parse --abbrev-ref HEAD', { stdout: 'clone-refactor/r1\n' }],
+      // First-match-wins: these narrow reads precede GIT_OK's broad ones. The first
+      // answer is the baseline read of the FIRST scan (a refresh resumes the run and
+      // never re-reads it), the second the verification's reconcile.
+      ['git status --porcelain', [{ stdout: '' }, { stdout: ` M ${PATCHED}\u0000` }]],
+      ['git diff --name-only -z abc123', [{ stdout: '' }, { stdout: `${PATCHED}\u0000` }]],
+      ...GIT_OK,
+      ['msbuild', { stdout: 'Build succeeded\n' }],
+      ['git add', {}],
+      ['git commit', {}],
+    ])
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csvA },
+      authorization: { enabled: true, maxClusters: 2 },
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
+      submit: { mode: 'commit' },
+    }, runner)
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    const first = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'extracted the shared computation', files_changed: [PATCHED],
+      evidence: { file: PATCHED, line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    expect((first as { isError?: boolean }).isError, rendered(first)).not.toBe(true)
+
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base', csv_path: csvB, refresh: true })
+    await settle(ctx, 'r1')
+
+    const reAssessed = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'the same computation is duplicated against the new neighbour', files_changed: [PATCHED],
+      evidence: { file: PATCHED, line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    expect((reAssessed as { isError?: boolean }).isError, rendered(reAssessed)).not.toBe(true)
+
+    const verified = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((verified as { isError?: boolean }).isError, rendered(verified)).not.toBe(true)
+    await settle(ctx, 'r1')
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError, rendered(submitted)).not.toBe(true)
+    expect((JSON.parse(rendered(submitted)) as { committed: boolean }).committed).toBe(true)
+    expect(runner.calls.map(entry => entry.argv.join(' ')))
+      .toContain(`git commit --only -m clone refactor(r1): deduplicate 1 file(s) -- ${PATCHED}`)
+  })
+
+  it('names the earlier-revision authorization when a refresh freezes clone_verify', async () => {
+    // The run that skips the re-assess and calls clone_verify instead. The freeze is
+    // correct — the current revision authorizes nothing — but the file it names is one
+    // the user DID authorize, under the revision the refresh retired. Telling the
+    // operator to revert it is telling them to undo work they consented to, and hides
+    // the one call that resolves the freeze.
+    const root = await workspace()
+    const csvA = join(root, 'func_clone_base.csv')
+    const csvB = join(root, 'func_clone_base_v2.csv')
+    const PATCHED = 'module/laws/src/a.cpp'
+    await writeFile(csvA, `${CSV_HEADER}p1,${PATCHED},ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    await writeFile(csvB, `${CSV_HEADER}p9,${PATCHED},ComputeArea,10-20,module/laws/src/c.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csvA },
+      authorization: { enabled: true, maxClusters: 2 },
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
+    }, fakeRunner([
+      ['git checkout -B', { stdout: '' }],
+      ['git status --porcelain', [{ stdout: '' }, { stdout: ` M ${PATCHED}\u0000` }]],
+      ['git diff --name-only -z abc123', [{ stdout: '' }, { stdout: `${PATCHED}\u0000` }]],
+      ...GIT_OK,
+    ]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'extracted the shared computation', files_changed: [PATCHED],
+      evidence: { file: PATCHED, line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base', csv_path: csvB, refresh: true })
+    await settle(ctx, 'r1')
+
+    const frozen = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((frozen as { isError?: boolean }).isError).toBe(true)
+    const message = rendered(frozen)
+    expect(message).toMatch(/UNAUTHORIZED_CHANGES/)
+    expect(message).toContain(PATCHED)
+    expect(message).toMatch(/EARLIER scan revision/)
+    expect(message).toMatch(/clone_assess/)
+    expect(message).toMatch(/instead of reverting/)
+  })
 })
 
 describe('clone_check', () => {
@@ -1550,5 +1703,155 @@ describe('a resolved freeze is not reported as a freeze', () => {
     const report = await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')
     expect(report).not.toContain('本 run 已冻结')
     expect(report).not.toContain('## 未授权改动')
+  })
+})
+
+describe('the summary is the submit gate\'s own newest attempt', () => {
+  const STEPS = { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] }
+  const PATCHED = 'module/laws/src/a.cpp'
+  const SNEAKY = 'module/laws/src/sneaky.cpp'
+
+  /**
+   * A run whose attempt 1 PASSED and whose attempt 2 then froze on an out-of-ledger
+   * change. The freeze happens before the job starts, so attempt 2 has a
+   * `reconcile.json` and no `result.json` at all — the state in which the readable
+   * attempt list stops at attempt 1.
+   */
+  async function passedThenFrozen(): Promise<{ root: string, ctx: Context, runner: ReturnType<typeof fakeRunner> }> {
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,${PATCHED},ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const runner = fakeRunner([
+      ['git checkout -B', { stdout: '' }],
+      ['git rev-parse --abbrev-ref HEAD', { stdout: 'clone-refactor/r1\n' }],
+      // First-match-wins, and each array sticks on its last entry: the baseline read,
+      // attempt 1's reconcile against the ledger, then attempt 2's with a file nobody
+      // authorized.
+      ['git status --porcelain', [
+        { stdout: '' },
+        { stdout: ` M ${PATCHED}\u0000` },
+        { stdout: ` M ${PATCHED}\u0000 M ${SNEAKY}\u0000` },
+      ]],
+      ['git diff --name-only -z abc123', [
+        { stdout: `${PATCHED}\u0000` },
+        { stdout: `${PATCHED}\u0000${SNEAKY}\u0000` },
+      ]],
+      ...GIT_OK,
+      ['msbuild', { stdout: 'Build succeeded\n' }],
+      ['git add', {}],
+      ['git commit', {}],
+    ])
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true, maxClusters: 2 },
+      verify: STEPS,
+      submit: { mode: 'commit' },
+    }, runner)
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    const assessed = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'extracted the shared computation', files_changed: [PATCHED],
+      evidence: { file: PATCHED, line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    expect((assessed as { isError?: boolean }).isError, rendered(assessed)).not.toBe(true)
+    const passed = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((passed as { isError?: boolean }).isError, rendered(passed)).not.toBe(true)
+    await settle(ctx, 'r1')
+    expect((JSON.parse(await readFile(join(root, 'runs', 'r1', 'verify', '1', 'result.json'), 'utf8')) as { ok: boolean }).ok).toBe(true)
+    const frozen = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((frozen as { isError?: boolean }).isError, rendered(frozen)).toBe(true)
+    return { root, ctx, runner }
+  }
+
+  it('does not report verify_ok for a run whose newest attempt has no result', async () => {
+    // The two artefacts a human and a machine trust. `summary.json` said
+    // `verify_attempts: 1, verify_ok: true, unverified: false` — about the attempt
+    // BEFORE the newest one — while `clone_submit` refused the same run because
+    // attempt 2 left no outcome. report.md printed "最新一次 ok: true" and omitted the
+    // "a patched cluster has no passing verification" warning.
+    const { root, ctx } = await passedThenFrozen()
+
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError).toBe(true)
+
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError, rendered(reported)).not.toBe(true)
+    const summary = JSON.parse(await readFile(join(root, 'runs', 'r1', 'summary.json'), 'utf8')) as {
+      verify_attempts: number, verify_ok: boolean, unverified: boolean
+    }
+    // The readable attempt count is still 1: that is what is on disk to read. The
+    // verdict is about the newest attempt DIRECTORY, which is 2 and has no result.
+    expect(summary.verify_attempts).toBe(1)
+    expect(summary.verify_ok).toBe(false)
+    expect(summary.unverified).toBe(true)
+    const report = await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')
+    expect(report).toContain('最新一次 ok: false')
+    expect(report).toContain('有已 patch 的簇没有通过的验证')
+  })
+
+  it('names the unauthorized files when a frozen run is submitted', async () => {
+    // A frozen `clone_verify` throws before it starts a job, so the newest attempt has
+    // a `reconcile.json` and no `result.json` — and with attempt 1 the only readable
+    // result, the oldest refusal ("no result record", or "no passing clone_verify" when
+    // the freeze is the FIRST attempt) fired instead. Safe, but it never mentioned the
+    // freeze, and the audit holding the unauthorized file was sitting right there.
+    const { root, ctx } = await passedThenFrozen()
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError).toBe(true)
+    const refusal = rendered(submitted)
+    expect(refusal).toMatch(/frozen/)
+    expect(refusal).toContain(SNEAKY)
+    // The audit it rests on is the newest attempt's, and it is still on disk.
+    const audit = JSON.parse(await readFile(join(root, 'runs', 'r1', 'verify', '2', 'reconcile.json'), 'utf8')) as { unauthorized: string[] }
+    expect(audit.unauthorized).toEqual([SNEAKY])
+  })
+
+  it('names the unauthorized files when the FREEZE is the first attempt', async () => {
+    // The same refusal when no attempt ever recorded a result: `attempts` is empty, so
+    // the gate's own freeze branch was unreachable through the tools — `clone_submit`
+    // answered "No passing clone_verify for this run", which names no file and gives no
+    // remedy, while `verify/1/reconcile.json` held the answer.
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,${PATCHED},ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true, maxClusters: 2 },
+      verify: STEPS,
+      submit: { mode: 'commit' },
+    }, fakeRunner([
+      ['git checkout -B', { stdout: '' }],
+      ['git status --porcelain', [
+        { stdout: '' },
+        { stdout: ` M ${PATCHED}\u0000 M ${SNEAKY}\u0000` },
+      ]],
+      ['git diff --name-only -z abc123', [
+        { stdout: `${PATCHED}\u0000${SNEAKY}\u0000` },
+      ]],
+      ...GIT_OK,
+    ]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'extracted the shared computation', files_changed: [PATCHED],
+      evidence: { file: PATCHED, line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    const frozen = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((frozen as { isError?: boolean }).isError).toBe(true)
+    await expect(readFile(join(root, 'runs', 'r1', 'verify', '1', 'result.json'), 'utf8')).rejects.toThrow()
+
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError).toBe(true)
+    const refusal = rendered(submitted)
+    expect(refusal).toMatch(/frozen/)
+    expect(refusal).toContain(SNEAKY)
   })
 })

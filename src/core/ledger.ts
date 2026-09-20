@@ -42,6 +42,11 @@ export interface LedgerRead {
  * cluster set, so it does not count. Hiding it is the conservative direction —
  * the run reports a coverage gap a human can resolve with one `clone_assess`,
  * while the other direction closes the run on a verdict about a different family.
+ *
+ * That recovery is only real while the WRITE side applies the same rule, which is
+ * why {@link recordAssessment} asks this question about the record's own revision
+ * rather than about the file: a stale verdict is not a duplicate, so it may be
+ * re-recorded plainly.
  */
 export function seenAtRevision(record: { scan_revision?: string }, revision: string | undefined): boolean {
   if (revision === undefined) return true
@@ -53,8 +58,8 @@ export function seenAtRevision(record: { scan_revision?: string }, revision: str
  *
  * Passing the current scan `revision` restricts the read to the records of that
  * revision, which is what the coverage contract needs after a refresh. Passing
- * nothing reads the whole file, which is what `recordAssessment`'s
- * replace-detection needs.
+ * nothing reads the whole file, which is what a run with no recorded revision
+ * needs: no record can be shown to be stale.
  */
 export async function loadAssessments(paths: RunPaths, revision?: string): Promise<LedgerRead> {
   const { records, droppedLines } = await readJsonl<Assessment>(paths.assessments)
@@ -89,16 +94,34 @@ export async function repairTornTail(file: string): Promise<boolean> {
   return true
 }
 
-/** Append one verdict, refusing a silent overwrite of an existing cluster. */
+/**
+ * Append one verdict, refusing a silent overwrite of an existing cluster.
+ *
+ * The duplicate check is REVISION-AWARE, through the record's own `scan_revision`.
+ * Cluster ids are positional, so a refresh renumbers C001 onto a different family:
+ * a verdict under an earlier revision is stale, every reader above already ignores
+ * it (`seenAtRevision`), and a plain `clone_assess` is the documented way to
+ * re-record the verdict for the new family. Refusing that call told the model to
+ * overwrite a verdict the coverage contract had stopped counting, while the
+ * docblock of `seenAtRevision` promised exactly that one plain call.
+ *
+ * A verdict under the CURRENT revision is a genuine duplicate and still needs
+ * `replace: true`: that is what stops a model from silently retracting a verdict it
+ * already recorded about this cluster set.
+ *
+ * `replaced` therefore means "an earlier verdict about the CURRENT cluster set is
+ * superseded" — not "the file grew another line for this id". A stale-revision
+ * record stays in the append-only history; it just no longer counts.
+ */
 export async function recordAssessment(
   paths: RunPaths,
   assessment: Assessment,
   options: { replace: boolean },
 ): Promise<{ replaced: boolean }> {
-  const { latest } = await loadAssessments(paths)
+  const { latest } = await loadAssessments(paths, assessment.scan_revision)
   const replaced = latest.has(assessment.cluster_id)
   if (replaced && !options.replace) {
-    throw new Error(`'${assessment.cluster_id}' already has a verdict. Pass replace: true to overwrite it.`)
+    throw new Error(`'${assessment.cluster_id}' already has a verdict for this scan revision. Pass replace: true to overwrite it.`)
   }
   await repairTornTail(paths.assessments)
   await appendJsonl(paths.assessments, assessment)

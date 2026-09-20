@@ -46,6 +46,28 @@ describe('assessments', () => {
     expect(latest.get('C001')?.verdict).toBe('patched')
   })
 
+  it('lets a verdict from an earlier scan revision be re-recorded without replace', async () => {
+    // A refresh rewrites `clusters.jsonl`, so the positional id C001 can name a
+    // completely different family. The verdict about the OLD family is stale — it is
+    // not a duplicate of a verdict about the new cluster set — and the documented
+    // recovery after a refresh is a plain `clone_assess`. Refusing it with "already
+    // has a verdict" told the model to pass `replace: true` to overwrite a verdict
+    // the coverage contract had already stopped counting.
+    const target = await paths()
+    await recordAssessment(target, { ...assessment('C001', 'report_only'), scan_revision: 'rev-1' }, { replace: false })
+    const re = await recordAssessment(target, { ...assessment('C001', 'skipped'), scan_revision: 'rev-2' }, { replace: false })
+    // Nothing in the CURRENT revision was superseded, which is what `replaced` says.
+    expect(re.replaced).toBe(false)
+    const current = await loadAssessments(target, 'rev-2')
+    expect(current.latest.get('C001')?.verdict).toBe('skipped')
+    expect(current.history).toHaveLength(1)
+    // The other direction: a duplicate under the SAME revision is still refused, so a
+    // model cannot silently retract a verdict it already recorded for this set.
+    await expect(recordAssessment(target, { ...assessment('C001', 'skipped'), scan_revision: 'rev-2' }, { replace: false }))
+      .rejects.toThrow(/already has a verdict/)
+    expect((await loadAssessments(target, 'rev-2')).history).toHaveLength(1)
+  })
+
   it('keeps the newest record per cluster', async () => {
     const target = await paths()
     await recordAssessment(target, assessment('C001', 'report_only'), { replace: false })

@@ -46,6 +46,21 @@ export function renderCommitMessage(template: string, values: Record<string, str
   })
 }
 
+/**
+ * What a timed-out OUTWARD command means, and the only thing to do about it.
+ *
+ * `assertCompleted` refuses `{ exitCode: 0, timedOut: true }` because the child may
+ * have finished as our deadline fired. For `git add`, `git commit`, `git push` and
+ * `gh pr create` "may have finished" is the whole problem: the commit, the push or
+ * the PR may EXIST. The refusal that says only "cut off by its timeout" reads as
+ * "nothing happened", so an operator retries and gets a second commit or a rejected
+ * push with no hint of why. This sentence is the remedy the other gate refusals have,
+ * and it is plain caller text — never captured output, which is what keeps it safe to
+ * append to the shared guard's message.
+ */
+const OUTWARD_TIMEOUT_REMEDY =
+  'It may still have taken effect, so check `git log` and `git ls-remote` before retrying; nothing was reported as done.'
+
 async function run(input: SubmitInput, argv: readonly string[], steps: string[]): Promise<string> {
   const result = await input.runner.run({ argv, cwd: input.projectRoot, timeoutMs: 600_000, signal: input.signal })
   // The shared MUTATING-command guard, not a bare `exitCode !== 0` check: a child
@@ -54,7 +69,7 @@ async function run(input: SubmitInput, argv: readonly string[], steps: string[])
   // this, all four steps below were recorded as successful outward actions over a
   // command that may never have completed. `lossy` stays exempt: the stdout here is
   // only a log line, which the guard documents.
-  assertCompleted(result, `${argv.join(' ')} failed`)
+  assertCompleted(result, `${argv.join(' ')} failed`, OUTWARD_TIMEOUT_REMEDY)
   steps.push(argv.join(' '))
   return result.stdout.trim()
 }
