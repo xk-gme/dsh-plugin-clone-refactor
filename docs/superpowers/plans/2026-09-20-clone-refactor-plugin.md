@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - 包名 `dsh-gme-clone-refactor`；插件行 id `gme-clone-refactor`；工具名前缀 `clone_`；run 默认根 `$DSH_HOME/gme-clone-refactor/runs`。
-- 所有 `@deepseek-ai/*` 官方包一律 **peerDependencies**（`@deepseek-ai/cordis` 用 `^4.0.1`，其余用 `>=0.1.2-alpha.1 <0.2.0-0`），并**同时**以精确版本 `0.1.2-alpha.5` 列进 devDependencies。漏掉 devDependencies 会让 pnpm 的 auto-install-peers 去装 `latest`（`@deepseek-ai/dsh-tools` 的 latest 是 `0.0.1-rc.1`）。
+- 所有 `@deepseek-ai/*` 官方包一律 **peerDependencies**，并**同时**以精确版本 `0.1.2-alpha.5` 列进 devDependencies。范围按既有惯例：`@deepseek-ai/dsh-*` 运行时包用 `>=0.1.2-alpha.1 <0.2.0-0`，`@deepseek-ai/cordis` 用 `^4.0.1`，`@deepseek-ai/schemastery` 用 `^3.18.1`；`@deepseek-ai/dsh-llm` 只有测试需要，**只列 devDependencies**。漏掉 devDependencies 会让 pnpm 的 auto-install-peers 去装 `latest`（`@deepseek-ai/dsh-tools` 的 latest 是 `0.0.1-rc.1`）。
 - `apply()` 与 `resolveSettings()` **永远不许抛错**：一条 config 校验失败会让整棵插件树失败（`dsh: 1 entry did not activate`）。坏值一律降级到文档化默认值 + warning。
 - **目标仓库永不被插件写入**：除模型在 `projectRoot` 上打的 patch 外，所有写入落在 run 目录。`run_id` 逃逸 `artifactsRoot` 一律拒绝。
 - 源码内导入使用 `.ts` 扩展名（`allowImportingTsExtensions`）；ESM only；所有文件 UTF-8 + LF 行尾。
@@ -341,6 +341,14 @@ describe('resolveSettings', () => {
     expect(settings.projectRoot.includes('\\') || settings.projectRoot.includes('/')).toBe(true)
   })
 
+  it('warns about a nested section that is not an object instead of silently defaulting it', () => {
+    const { settings, warnings } = resolveSettings({ detection: 42, verify: 'nope' })
+    expect(settings.detection.provider).toBe('csv')
+    expect(settings.verify.steps).toEqual([])
+    expect(warnings.join('\n')).toMatch(/detection must be an object/)
+    expect(warnings.join('\n')).toMatch(/verify must be an object/)
+  })
+
   it('keeps a well-formed verify step list and drops malformed entries', () => {
     const { settings, warnings } = resolveSettings({
       verify: {
@@ -349,7 +357,8 @@ describe('resolveSettings', () => {
           { name: 'build-debug', phase: 'build', command: 'msbuild tests.sln', required: true, timeoutMs: 600000 },
           { name: '', command: 'echo x' },
           { name: 'no-command' },
-          { name: 'restore-config', phase: 'restore', command: 'restore.ps1', always: true },
+          // No `always` key on purpose: the default is what this case exists to pin.
+          { name: 'restore-config', phase: 'restore', command: 'restore.ps1' },
         ],
       },
     })
@@ -359,8 +368,9 @@ describe('resolveSettings', () => {
       name: 'build-debug', phase: 'build', command: 'msbuild tests.sln',
       required: true, always: false, timeoutMs: 600000,
     })
-    // `always` defaults to true for the restore phase: a restore step that is
-    // skipped after a failure is the one thing a pipeline must never do.
+    // `always` defaults to true only for the restore phase — a restore step that
+    // is skipped after a failure is the one thing a pipeline must never do. Both
+    // halves are asserted: passing `always: true` explicitly would test nothing.
     expect(settings.verify.steps[1]?.always).toBe(true)
     expect(warnings.join('\n')).toMatch(/verify\.steps\[1\]/)
     expect(warnings.join('\n')).toMatch(/verify\.steps\[2\]/)
@@ -447,8 +457,19 @@ export interface Settings {
 /** What a warning prints in place of a value nothing here can describe. */
 const UNRENDERABLE = '[unserializable]'
 
-function record(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+/**
+ * Read a nested section. A *present* value that is not a plain object is a
+ * configuration mistake, and this file exists so mistakes are reported: a
+ * silently-defaulted `detection: 42` leaves the operator with no idea why their
+ * settings do nothing. An absent value is not a mistake and warns nothing.
+ */
+function record(value: unknown, label: string, warnings: string[]): Record<string, unknown> {
+  if (value === undefined || value === null) return {}
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    warnings.push(`${label} must be an object; using its defaults`)
+    return {}
+  }
+  return value as Record<string, unknown>
 }
 
 /**
@@ -520,7 +541,14 @@ function verifySteps(value: unknown, warnings: string[]): VerifyStep[] {
   }
   const steps: VerifyStep[] = []
   for (const [index, item] of value.entries()) {
-    const raw = record(item)
+    // Guarded here rather than through `record` so one bad item yields exactly one
+    // warning: a non-object entry is dropped, it does not also complain about a
+    // missing name and command.
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+      warnings.push(`verify.steps[${index}] must be an object; dropped`)
+      continue
+    }
+    const raw = item as Record<string, unknown>
     const name = typeof raw.name === 'string' ? raw.name.trim() : ''
     const command = typeof raw.command === 'string' ? raw.command.trim() : ''
     if (name === '' || command === '') {
@@ -543,7 +571,7 @@ function verifySteps(value: unknown, warnings: string[]): VerifyStep[] {
 }
 
 function detectionSettings(value: unknown, warnings: string[]): DetectionSettings {
-  const raw = record(value)
+  const raw = record(value, 'detection', warnings)
   return {
     provider: oneOf(raw.provider, PROVIDERS, 'csv', 'detection.provider', warnings),
     csvPath: text(raw.csvPath, '', 'detection.csvPath', warnings),
@@ -564,13 +592,13 @@ function detectionSettings(value: unknown, warnings: string[]): DetectionSetting
  */
 export function resolveSettings(raw: unknown): { settings: Settings; warnings: string[] } {
   const warnings: string[] = []
-  const source = record(raw)
+  const source = record(raw, 'config', warnings)
   const projectRoot = text(source.projectRoot, '', 'projectRoot', warnings)
   const reportLanguage = oneOf(source.reportLanguage, ['zh', 'en'] as const, 'zh', 'reportLanguage', warnings)
-  const authorization = record(source.authorization)
-  const verify = record(source.verify)
-  const submit = record(source.submit)
-  const workdir = record(source.workdir)
+  const authorization = record(source.authorization, 'authorization', warnings)
+  const verify = record(source.verify, 'verify', warnings)
+  const submit = record(source.submit, 'submit', warnings)
+  const workdir = record(source.workdir, 'workdir', warnings)
   return {
     settings: {
       projectRoot: projectRoot === '' ? '' : resolve(projectRoot),
@@ -3500,7 +3528,8 @@ git commit -m "feat(submit): commit, push and open a PR strictly by mode"
 ### Task 13: 六个工具与插件入口
 
 **Files:**
-- Create: `src/tools.ts`, `src/index.ts`
+- Create: `src/tools.ts`
+- Replace: `src/index.ts`（**替换 Task 1 建立的最小桩**；`name`、永不抛错的 `apply` 契约保持不变，`inject` 扩为 `['tools', 'systemPrompt']`，`src/core/clusters.ts` 与 `src/verify/artifacts.ts` 同批创建）
 - Test: `tests/workflow.spec.ts`（Task 14 写完整链路，本任务先写工具级测试）
 
 **Interfaces:**
