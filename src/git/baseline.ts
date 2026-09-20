@@ -109,7 +109,7 @@ export async function readBaseline(runner: CommandRunner, projectRoot: string): 
   const head = (await capture(runner, projectRoot, ['git', 'rev-parse', 'HEAD'])).trim()
   const branch = (await capture(runner, projectRoot, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'])).trim()
   // A status we cannot trust is NOT a clean tree. `dirty: []` from a timeout, a
-  // null exit or a truncated capture reads to Task 6 as "safe to patch", and the
+  // null exit or a truncated capture reads to `openRun` as "safe to patch", and the
   // whole point of the baseline is that the tree's state is known. `changedFiles`
   // reads the same status through this same helper, so the two can never disagree
   // about what an unreadable status means.

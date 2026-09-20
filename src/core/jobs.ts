@@ -1,8 +1,12 @@
 /**
  * Persisted job records: the only progress source that survives a reload.
  *
- * A job left `running` is an interrupted job, and the report says so. Anything
- * else would let a killed verification read as a passed one.
+ * A job left `running` has no terminal record, and the report says so. There are
+ * exactly two ways that happens: the run was interrupted, or the terminal status
+ * could not be written — and a task that SUCCEEDED can leave the record at
+ * `running`, because the failure of that write reaches the caller's
+ * `onPersistFailure` hook instead of being discarded. Neither cause is a success;
+ * anything else would let a killed verification read as a passed one.
  */
 import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'

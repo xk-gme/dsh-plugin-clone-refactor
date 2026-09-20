@@ -54,7 +54,8 @@ export function summarizeReport(input: ReportInput): ReportSummary {
     // authorized is the single most important thing a report can surface.
     unauthorized_files: [...new Set(input.unauthorized)].sort(),
     // A patched cluster whose verification never completed is not a success, and
-    // the summary has to say so even when the job was interrupted rather than failed.
+    // the summary has to say so whether the attempt failed or the job's terminal
+    // record never landed: `running` means "no terminal record", not "interrupted".
     unverified: base.patched > 0 && !base.verify_ok,
     dropped_lines: input.droppedLines.length,
   }
@@ -222,7 +223,7 @@ export function renderReport(input: ReportInput): string {
       ...summary.unauthorized_files.map(file => `  - \`${file}\``), '')
   }
   if (input.job !== undefined) {
-    lines.push('## 最近的后台任务 / Last job', '', `- \`${input.job.job_id}\` (${input.job.kind}) → **${input.job.status}**${input.job.error === null ? '' : `: ${input.job.error}`}`, ...(input.job.status === 'running' ? ['- 停在 running 说明任务被中断，不是成功。'] : []), '')
+    lines.push('## 最近的后台任务 / Last job', '', `- \`${input.job.job_id}\` (${input.job.kind}) → **${input.job.status}**${input.job.error === null ? '' : `: ${input.job.error}`}`, ...(input.job.status === 'running' ? ['- 停在 running 说明没有终态记录：要么任务被中断，要么终态写盘失败（任务本身可能已经成功）。两种情况都不算成功。'] : []), '')
   }
   if (input.droppedLines.length > 0) {
     lines.push('## 跳过的账本行 / Dropped ledger lines', '', `- findings 中 ${input.droppedLines.length} 行不是合法 JSON（行号：${input.droppedLines.join(', ')}）`, '')

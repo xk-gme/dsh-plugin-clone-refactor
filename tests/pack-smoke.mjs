@@ -1,12 +1,10 @@
 /**
- * The packaged artefact must contain exactly what the plugin needs at runtime:
- * `lib/index.js` plus the patch layer. A missing patch file means a marketplace
- * install that silently does nothing, and a packed entry point that does not
- * load is the same class of failure.
- *
- * The READMEs are deliberately NOT asserted here: Task 15 creates them, and
- * asserting a file that does not exist yet would fail this task for a reason
- * this task cannot fix. Task 15 extends this list once they exist.
+ * The packaged artefact must contain exactly what the plugin needs at runtime and
+ * at install time: `lib/index.js`, the patch layer, the LICENSE, the two READMEs
+ * and the two setup docs. A missing patch file means a marketplace install that
+ * silently does nothing, a missing document is the same failure for the person
+ * reading the package page, and a packed entry point that does not load is that
+ * failure class once more.
  */
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
@@ -33,7 +31,7 @@ for (let index = lines.length - 1; index >= 0 && report === undefined; index -= 
 if (report === undefined) throw new Error(`npm pack --json wrote no parseable JSON report:\n${raw}`)
 const [entry] = report
 const files = entry.files.map(file => file.path.replaceAll('\\', '/'))
-for (const required of ['lib/index.js', 'cordis.patch.yml', 'LICENSE']) {
+for (const required of ['lib/index.js', 'cordis.patch.yml', 'LICENSE', 'README.md', 'README.zh.md', 'docs/setup.md', 'docs/setup.zh.md']) {
   if (!files.includes(required)) throw new Error(`the packaged artefact is missing ${required}`)
 }
 if (files.some(file => file.startsWith('docs/superpowers/'))) throw new Error('internal design docs must not be published')

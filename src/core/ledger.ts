@@ -6,8 +6,10 @@
  * `clusters.jsonl` is rewritten wholesale by a scan and `assessments.jsonl` is
  * appended to; they are never both written to, so they need no shared writer
  * discipline today. If a later task ever appends to `clusters.jsonl` while
- * another rewrites it, revisit that: `writeAtomic`'s fixed `<file>.tmp` name and
- * the read-modify-write race would both start to matter.
+ * another rewrites it, revisit that: the read-modify-write race would start to
+ * matter. The temp-name half of that hazard is already closed — `writeAtomic`
+ * names each call's temp file uniquely, so two writers can no longer rename away
+ * each other's temp.
  */
 import { readFile } from 'node:fs/promises'
 import { appendJsonl, readJsonl } from './jsonl.ts'

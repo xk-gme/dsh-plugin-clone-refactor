@@ -102,7 +102,8 @@ export async function runVerification(options: EngineOptions): Promise<VerifyRes
     attempt: options.attempt,
     // Vacuous truth by design: with no configured steps nothing required failed, so
     // `ok` is true. A caller that reads `ok` as "this patch was verified" MUST
-    // therefore refuse an empty step list itself — Task 13's clone_verify does — and
+    // therefore refuse an empty step list itself — the `clone_verify` tool in
+    // `src/tools.ts` does — and
     // the test below pins this vacuity so it stays a decision rather than a surprise.
     ok: !results.some(result => result.required && !result.ok),
     started_at: startedAt,

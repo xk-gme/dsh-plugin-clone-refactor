@@ -65,10 +65,11 @@ export function guidanceText(settings: Settings, configured: boolean): string {
   }
   const lines = [
     'GME clone refactor: clone_scan produces the clone families of one module and is the coverage contract — every cluster must end with a verdict before clone_report closes the run.',
-    'clone_check is read-only and is how progress is polled: clone_scan and clone_verify are background jobs, so a call returns accepted and the job record is the truth. A job stuck at running was interrupted, not successful.',
+    'clone_check is read-only and is how progress is polled: clone_scan and clone_verify are background jobs, so a call returns accepted and the job record is the truth. A job left at running has no terminal record: either the run was interrupted, or its terminal status could not be written — a task that succeeded can leave that record behind. Neither is a success, so never report a job at running as done.',
     'Judge each cluster from the real source, not from the CSV excerpt. The clustering is structural only: it has no skeleton or risk-signal analysis, so the priority is yours to decide.',
     'A patched verdict needs confirm: true, authorization.enabled, the files it changed and evidence. A P0 cluster you leave unpatched needs evidence of the concrete blocker — "semantics unclear" is not evidence and is rejected.',
     'clone_verify reconciles the authorization ledger against the actual git diff first: a changed file the user never authorized freezes the run with UNAUTHORIZED_CHANGES. Never edit around that.',
+    'Retracting authorization is not reverting the patch: re-assessing a patched cluster as report_only or skipped deletes its authorization record, but the file it changed stays changed in the work tree, so clone_verify freezes the run. Give the user both ways out — they restore the file themselves (git restore --source=HEAD -- <file>), or the cluster is recorded as patched again with replace: true and confirm: true. Nothing restores a file automatically: that is the design, not an oversight.',
     'Nothing may be submitted before a passing clone_verify, and clone_submit needs confirm: true. Report the outcome to the user; do not submit on your own initiative.',
   ]
   if (!settings.authorization.enabled) lines.push('Patching is DISABLED in this deployment: you may still scan, judge and report, but clone_assess rejects a patched verdict. Say so instead of editing files.')
