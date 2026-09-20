@@ -237,6 +237,17 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         await savePatches(paths, existing === -1
           ? [...patches, updated]
           : patches.map((patch, index) => (index === existing ? updated : patch)))
+      } else {
+        // Retract the authorization when a cluster is re-assessed away from
+        // `patched` (R49). Leaving the record would be a stale authorization: the
+        // latest verdict says this cluster must not be patched, while
+        // `clone_verify` still authorizes its files, `clone_submit` stages and
+        // commits them, and the report lists them under authorized changes. The
+        // tooling is the half that acts, so it must follow the verdict. Dropping
+        // the record is what makes acting on the stale consent impossible.
+        const patches = await loadPatches(paths)
+        const retained = patches.filter(patch => patch.cluster_id !== clusterId)
+        if (retained.length !== patches.length) await savePatches(paths, retained)
       }
       const { latest } = await loadAssessments(paths)
       const covered = clusters.filter(cluster => latest.has(cluster.id)).length

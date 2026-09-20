@@ -107,6 +107,36 @@ async function loadVerifyAttemptsOf(root: string): Promise<number[]> {
   return (await loadVerifyAttempts(runPaths(join(root, 'runs'), 'r1'))).map(attempt => attempt.attempt)
 }
 
+/** The authorization ledger as the tools read it. */
+async function loadPatchesOf(root: string): Promise<Array<{ cluster_id: string }>> {
+  const { loadPatches } = await import('../src/core/ledger.ts')
+  const { runPaths } = await import('../src/core/artifacts.ts')
+  return await loadPatches(runPaths(join(root, 'runs'), 'r1'))
+}
+
+/** Every `git <verb>` this runner was asked to run, for "nothing outward" checks. */
+function gitVerbsOf(runner: ReturnType<typeof fakeRunner>): string[] {
+  return runner.calls.filter(call => call.argv[0] === 'git').map(call => call.argv[1] ?? '')
+}
+
+/**
+ * One entry per `git status --porcelain` read, resting on the dirty answer: the
+ * run's baseline read is clean, and every later read — the reconcile's — sees the
+ * patch. `readBaseline` insists on a trustworthy status, so the sequence is what
+ * makes a run start against a tree that is about to look modified.
+ */
+const CLEAN_THEN_PATCHED: FakeScriptEntry = ['git status --porcelain', [
+  { stdout: '' },
+  { stdout: ' M module/laws/src/a.cpp\n' },
+]]
+
+/** The tracked file the rollback would restore, plus the two rollback verbs. */
+const ROLLBACK_CALLS: FakeScriptEntry[] = [
+  ['git restore', { exitCode: 0 }],
+  ['git ls-files', { stdout: 'module/laws/src/a.cpp\u0000' }],
+  ['git clean', { exitCode: 0 }],
+]
+
 describe('clone_assess authorization rules', () => {
   it('refuses a patched verdict while patching is disabled', async () => {
     const root = await workspace()
@@ -235,6 +265,62 @@ describe('clone_assess authorization rules', () => {
     expect((verified as { isError?: boolean }).isError, rendered(verified)).not.toBe(true)
   })
 
+  it('retracts the authorization when a patched cluster is re-assessed as report_only', async () => {
+    // R49: the ledger must follow the latest verdict, not stay behind it. A
+    // leftover PatchRecord is a stale authorization — clone_verify would still
+    // authorize the files and clone_submit would still commit them, while the
+    // cluster's own verdict says it must not be patched.
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const runner = fakeRunner([
+      ['git checkout -B', { stdout: '' }],
+      // The sequence rests on the patched answer, so one entry covers the baseline
+      // read, the verify reconcile and anything that asks afterwards.
+      CLEAN_THEN_PATCHED,
+      ...GIT_OK,
+    ])
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true },
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
+    }, runner)
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+
+    const patched = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'patched', priority: 'P0',
+      reason: 'bodies are identical', files_changed: ['module/laws/src/a.cpp'],
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    expect((patched as { isError?: boolean }).isError, rendered(patched)).not.toBe(true)
+    expect(await loadPatchesOf(root)).toHaveLength(1)
+
+    const reconsidered = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'report_only', priority: 'P0',
+      reason: 'on reflection the callee is virtual, so this must not be refactored',
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'virtual void draw();' },
+      replace: true,
+    })
+    expect((reconsidered as { isError?: boolean }).isError, rendered(reconsidered)).not.toBe(true)
+
+    // The retraction itself, read back through the public ledger reader.
+    expect(await loadPatchesOf(root)).toEqual([])
+
+    // And the consequence the retraction exists for: with nothing authorized, the
+    // still-modified file IS an unauthorized change, so verify freezes the run.
+    // That is the correct direction — a modified tree with no recorded consent is
+    // exactly what must not proceed — and it is a second, independent barrier
+    // against acting on the retracted consent.
+    const verified = await call(ctx, 'clone_verify', { run_id: 'r1' })
+    expect((verified as { isError?: boolean }).isError).toBe(true)
+    expect(rendered(verified)).toMatch(/UNAUTHORIZED_CHANGES/)
+    expect(rendered(verified)).toMatch(/module\/laws\/src\/a\.cpp/)
+  })
+
   it('requires evidence for a P0 report_only verdict', async () => {
     const root = await workspace()
     const csv = join(root, 'func_clone_base.csv')
@@ -318,6 +404,29 @@ describe('clone_submit', () => {
     expect((submitted as { isError?: boolean }).isError).toBe(true)
     expect(rendered(submitted)).toMatch(/confirm/)
   })
+
+  it('has nothing to submit when the authorization ledger is empty', async () => {
+    // The point of R49: an empty ledger is what makes a retracted authorization
+    // impossible to act on. The passing attempt is seeded directly so a ledger
+    // check is the only thing that can refuse this call.
+    const root = await workspace()
+    const runner = fakeRunner(GIT_OK)
+    const ctx = await mount({ projectRoot: 'D:/repo', artifactsRoot: join(root, 'runs') }, runner)
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    const { runPaths, writeAtomic } = await import('../src/core/artifacts.ts')
+    const paths = runPaths(join(root, 'runs'), 'r1')
+    await writeAtomic(join(paths.verifyDir, '1', 'result.json'), `${JSON.stringify({
+      attempt: 1, ok: true, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:00:01.000Z',
+      steps: [], rolled_back: false, rollback_files: [],
+    }, null, 2)}\n`)
+
+    const submitted = await call(ctx, 'clone_submit', { run_id: 'r1', confirm: true, mode: 'commit' })
+    expect((submitted as { isError?: boolean }).isError).toBe(true)
+    expect(rendered(submitted)).toMatch(/authorization ledger is empty/)
+    // Nothing outward: no `git commit` was ever attempted.
+    expect(gitVerbsOf(runner)).not.toContain('commit')
+  })
 })
 
 describe('clone_verify', () => {
@@ -385,24 +494,6 @@ describe('clone_verify', () => {
 })
 
 describe('clone_verify auto-rollback', () => {
-  /**
-   * One entry per `git status --porcelain` read, resting on the dirty answer: the
-   * run's baseline read is clean, and every later read — the reconcile's — sees
-   * the patch. `readBaseline` insists on a trustworthy status, so the sequence is
-   * what makes a run start against a tree that is about to look modified.
-   */
-  const CLEAN_THEN_PATCHED: FakeScriptEntry = ['git status --porcelain', [
-    { stdout: '' },
-    { stdout: ' M module/laws/src/a.cpp\n' },
-  ]]
-
-  /** The tracked file the rollback would restore, plus the two rollback verbs. */
-  const ROLLBACK_CALLS: FakeScriptEntry[] = [
-    ['git restore', { exitCode: 0 }],
-    ['git ls-files', { stdout: 'module/laws/src/a.cpp\u0000' }],
-    ['git clean', { exitCode: 0 }],
-  ]
-
   const STEPS = { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] }
 
   it('rolls a failed patch back when the baseline was clean', async () => {
