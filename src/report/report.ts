@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto'
 import { writeAtomic, type RunPaths } from '../core/artifacts.ts'
 import { PRIORITIES } from '../config.ts'
-import type { Assessment, Cluster, PatchRecord, VerifyResult } from '../core/schema.ts'
+import type { Assessment, ClonePair, ClonePairSide, Cluster, PatchRecord, VerifyResult } from '../core/schema.ts'
 import type { RunRecord } from '../core/run.ts'
 import type { JobRecord } from '../core/jobs.ts'
 import { coverageGaps } from '../core/ledger.ts'
@@ -60,12 +60,65 @@ export function summarizeReport(input: ReportInput): ReportSummary {
   }
 }
 
+/** The priority vocabulary, for grouping and for the overview's per-priority counts. */
+const PRIORITY_NAMES = new Set<string>(PRIORITIES)
+
+/** How much of a representative body a cell shows; the full bodies stay in findings.json. */
+const SNIPPET_CHARS = 80
+
+/**
+ * Make a value safe for one Markdown table cell. A model-written reason and an
+ * operator's command line both carry `|` routinely, and a newline breaks the row
+ * outright: the table would still *look* like a table while the evidence shifted a
+ * column, which is worse than a missing column.
+ */
+function cell(value: string): string {
+  return value.replaceAll(/\r\n|\r|\n/g, ' ').replaceAll('|', '\\|')
+}
+
+/** `` `path` `` or `` `path:10-20` ``: the line range is the other half of the evidence. */
+function sideCell(part: ClonePairSide): string {
+  const lines = part.lines.trim()
+  return `\`${cell(lines === '' ? part.file : `${part.file}:${lines}`)}\``
+}
+
+/** One short excerpt of the representative body; an empty body renders as an em dash. */
+function snippetCell(pair: ClonePair): string {
+  const body = (pair.left.body.trim() !== '' ? pair.left.body : pair.right.body).replaceAll(/\s+/g, ' ').trim()
+  if (body === '') return '—'
+  return `\`${cell(body.length > SNIPPET_CHARS ? `${body.slice(0, SNIPPET_CHARS)}…` : body)}\``
+}
+
 function clusterLine(cluster: Cluster, assessment: Assessment | undefined): string {
   const verdict = assessment?.verdict ?? 'MISSING'
   const priority = assessment?.priority ?? '-'
   const reason = assessment?.reason ?? 'no verdict recorded'
   const pair = cluster.representative
-  return `| \`${cluster.id}\` | ${priority} | ${verdict} | ${cluster.size} | \`${pair.left.file}\` ↔ \`${pair.right.file}\` | ${reason} |`
+  return `| \`${cell(cluster.id)}\` | ${cell(priority)} | ${cell(verdict)} | ${cluster.size} | ${sideCell(pair.left)} ↔ ${sideCell(pair.right)} | ${snippetCell(pair)} | ${cell(reason)} |`
+}
+
+/**
+ * Why a failed attempt left the work tree alone. The two deliberate suppressions are
+ * the dirty baseline — there is no baseline worth restoring to, and a restore would
+ * destroy the operator's own uncommitted work — and `verify.keepFailedPatch`. Printing
+ * nothing would make "we chose not to roll back" read exactly like "rollback was never
+ * a question".
+ */
+function rollbackSkipReason(input: ReportInput): string {
+  if (input.run.baseline.dirty.length > 0) {
+    return '基线不干净，自动回滚已按 `workdir.allowDirty` 的语义停用（回滚会把开跑前就有的改动一起抹掉）'
+  }
+  if (input.run.settings?.verify?.keepFailedPatch === true) return '`verify.keepFailedPatch: true`：按要求保留现场，便于人工排查'
+  return '没有记录到回滚文件'
+}
+
+/** Per-priority counts in the vocabulary's own order, with any other key last. */
+function priorityText(byPriority: Record<string, number>): string {
+  return [
+    ...PRIORITIES.map(priority => `${priority} ${byPriority[priority] ?? 0}`),
+    ...Object.keys(byPriority).filter(name => !PRIORITY_NAMES.has(name)).sort()
+      .map(name => `${name} ${byPriority[name] ?? 0}`),
+  ].join(' / ')
 }
 
 /** Render the human report. Pure: the same input always yields the same text. */
@@ -86,9 +139,10 @@ export function renderReport(input: ReportInput): string {
     '',
     `- 簇总数 clusters: ${summary.clusters}`,
     `- 已判定 recorded: ${summary.recorded}（patched ${summary.patched} / report_only ${summary.report_only} / skipped ${summary.skipped}）`,
+    `- 各优先级 by priority: ${priorityText(summary.by_priority)}`,
     `- 未判定 missing: ${summary.missing}`,
     `- 授权文件 authorized files: ${summary.authorized_files}`,
-    `- 验证 attempts: ${summary.verify_attempts}（ok: ${String(summary.verify_ok)}）`,
+    `- 验证 attempts: ${summary.verify_attempts}（最新一次 ok: ${String(summary.verify_ok)}）`,
     ...(summary.unverified ? ['- ⚠️ **有已 patch 的簇没有通过的验证**；这些改动不得提交'] : []),
     '',
   ]
@@ -104,6 +158,16 @@ export function renderReport(input: ReportInput): string {
       clusters: input.clusters.filter(cluster => input.assessments.get(cluster.id)?.priority === priority),
     })),
     {
+      // Assessed, but with a priority outside the vocabulary: no group above claimed it
+      // and it is not a gap either, so without this bucket the run would close claiming
+      // full coverage while its row was missing from the table.
+      title: '其他优先级 / other priority',
+      clusters: input.clusters.filter(cluster => {
+        const assessed = input.assessments.get(cluster.id)
+        return assessed !== undefined && !PRIORITY_NAMES.has(assessed.priority)
+      }),
+    },
+    {
       title: '未判定 / no verdict',
       clusters: input.clusters.filter(cluster => gapIds.has(cluster.id)),
     },
@@ -111,7 +175,7 @@ export function renderReport(input: ReportInput): string {
   for (const group of groups) {
     if (group.clusters.length === 0) continue
     lines.push(`### ${group.title}（${group.clusters.length}）`, '',
-      '| 簇 | 优先级 | 判定 | 对数 | 代表对 | 理由 |', '|---|---|---|---|---|---|',
+      '| 簇 | 优先级 | 判定 | 对数 | 代表对 | 片段 | 理由 |', '|---|---|---|---|---|---|---|',
       ...group.clusters.map(cluster => clusterLine(cluster, input.assessments.get(cluster.id))), '')
   }
   if (gaps.length > 0) {
@@ -128,7 +192,7 @@ export function renderReport(input: ReportInput): string {
       lines.push(`### attempt ${attempt.attempt} — ${attempt.ok ? 'PASS' : 'FAIL'}`, '')
       lines.push('| 步骤 | 阶段 | 命令 | 退出码 | 结果 | 日志 |', '|---|---|---|---|---|---|')
       for (const step of attempt.steps) {
-        lines.push(`| ${step.name} | ${step.phase} | \`${step.command}\` | ${String(step.exit_code)} | ${step.ok ? 'ok' : 'FAIL'} | \`${step.log_file}\` |`)
+        lines.push(`| ${cell(step.name)} | ${cell(step.phase)} | \`${cell(step.command)}\` | ${String(step.exit_code)} | ${step.ok ? 'ok' : 'FAIL'} | \`${cell(step.log_file)}\` |`)
       }
       // The engine returns only the steps it executed, and StepResult has no `skipped`
       // field, so a reader could not otherwise tell "not configured" from "skipped after
@@ -140,9 +204,13 @@ export function renderReport(input: ReportInput): string {
       const configured = (input.run.settings?.verify?.steps ?? []).map(step => step.name)
       const notRun = configured.filter(name => !ran.has(name))
       if (notRun.length > 0) {
-        lines.push('', `未执行 / not run: ${notRun.map(name => `\`${name}\``).join(', ')} —— 前序必需步骤失败后按规则跳过（本次共配置 ${configured.length} 步，实际执行 ${attempt.steps.length} 步）`)
+        lines.push('', `未执行 / not run: ${notRun.map(name => `\`${cell(name)}\``).join(', ')} —— 前序必需步骤失败后按规则跳过（本次共配置 ${configured.length} 步，实际执行 ${attempt.steps.length} 步）`)
       }
-      if (attempt.rolled_back) lines.push('', `已回滚 / rolled back: ${attempt.rollback_files.map(file => `\`${file}\``).join(', ')}`)
+      if (attempt.rolled_back) {
+        lines.push('', `已回滚 / rolled back: ${attempt.rollback_files.map(file => `\`${cell(file)}\``).join(', ')}`)
+      } else if (!attempt.ok) {
+        lines.push('', `未回滚 / not rolled back: ${rollbackSkipReason(input)}`)
+      }
       lines.push('')
     }
   } else {

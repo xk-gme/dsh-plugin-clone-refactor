@@ -112,6 +112,128 @@ describe('renderReport', () => {
     expect(text).toContain('### P2（1）')
     expect(text.indexOf('### P0')).toBeLessThan(text.indexOf('### P2'))
     expect(text.indexOf('`C002`')).toBeLessThan(text.indexOf('`C001`'))
+    // The row itself, not just the first mention of the id: whoever puts a bare id back
+    // in the cell, or lets the grouping drift, gets a red test rather than a silent pass.
+    expect(text).toContain('| `C002` | P0 | report_only |')
+  })
+
+  it('concludes verification from the newest attempt, not from every attempt ever recorded', () => {
+    const complete = new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]])
+    const outcome = (attempt: number, ok: boolean): VerifyResult => ({
+      attempt, ok, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      rolled_back: false, rollback_files: [],
+      steps: [{ name: 'build', phase: 'build', command: 'msbuild t.sln', required: true, always: false, exit_code: ok ? 0 : 1, ok, timed_out: false, log_file: `D:/runs/run-1/verify/${attempt}/1-build.log`, lossy: false }],
+    })
+    // The sequence the plan is built around: attempt 1 fails, the patch is fixed, attempt 2
+    // passes. A submit gate reads the newest attempt, so the closing report must too, or it
+    // tells a human not to commit work the tooling accepts.
+    const recovered = input({ verify: [outcome(1, false), outcome(2, true)], assessments: complete })
+    expect(summarizeReport(recovered).verify_ok).toBe(true)
+    expect(renderReport(recovered)).toContain('验证 attempts: 2（最新一次 ok: true）')
+    expect(renderReport(recovered)).not.toContain('有已 patch 的簇没有通过的验证')
+    // The other direction: a pass that a later failing attempt broke is not a pass, so
+    // "newest" cannot be satisfied by "some attempt passed".
+    const regressed = input({ verify: [outcome(1, true), outcome(2, false)], assessments: complete })
+    expect(summarizeReport(regressed).verify_ok).toBe(false)
+    expect(renderReport(regressed)).toContain('有已 patch 的簇没有通过的验证')
+  })
+
+  it('keeps a row intact when a reason carries a pipe or a newline', () => {
+    const reason = 'replaced `a | b` with `a || b`\nsecond line'
+    const text = renderReport(input({
+      assessments: new Map([
+        ['C001', { ...assessment('C001', 'patched'), reason }],
+        ['C002', assessment('C002', 'report_only')],
+      ]),
+    }))
+    const lines = text.split('\n')
+    const header = lines.find(line => line.startsWith('| 簇 |'))!
+    const row = lines.find(line => line.startsWith('| `C001`'))!
+    // An escaped pipe is content; a bare pipe is a column separator.
+    const columns = (line: string): number => line.replaceAll('\\|', '').split('|').length
+    expect(row).toContain('a \\| b')
+    expect(row).toContain('second line')
+    expect(columns(row)).toBe(columns(header))
+    // The newline is gone, so nothing spilled out of the row as a line of its own.
+    expect(lines.some(line => line.trim() === 'second line')).toBe(false)
+  })
+
+  it('escapes a verification command the same way, so the evidence row stays one row', () => {
+    const verify: VerifyResult = {
+      attempt: 1, ok: false, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      rolled_back: false, rollback_files: [],
+      steps: [{ name: 'build|debug', phase: 'build', command: 'msbuild a | b', required: true, always: false, exit_code: 1, ok: false, timed_out: false, log_file: 'D:/runs/run-1/verify/1/1-build.log', lossy: false }],
+    }
+    const text = renderReport(input({
+      verify: [verify],
+      assessments: new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]]),
+    }))
+    const lines = text.split('\n')
+    const header = lines.find(line => line.startsWith('| 步骤 |'))!
+    const row = lines.find(line => line.includes('msbuild a \\| b'))!
+    const columns = (line: string): number => line.replaceAll('\\|', '').split('|').length
+    expect(row).toContain('build\\|debug')
+    expect(columns(row)).toBe(columns(header))
+  })
+
+  it('keeps an assessed cluster whose priority is outside the vocabulary, instead of dropping its row', () => {
+    const text = renderReport(input({
+      assessments: new Map([
+        ['C001', { ...assessment('C001', 'report_only'), priority: 'P9' as unknown as Assessment['priority'] }],
+        ['C002', assessment('C002', 'report_only')],
+      ]),
+    }))
+    expect(text).toContain('### 其他优先级 / other priority（1）')
+    expect(text).toContain('| `C001` | P9 | report_only |')
+  })
+
+  it('carries the evidence for each cluster: the line range and a snippet of the body', () => {
+    const text = renderReport(input({
+      assessments: new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]]),
+    }))
+    const row = text.split('\n').find(line => line.startsWith('| `C001`'))!
+    expect(row).toContain('`module/laws/src/a.cpp:10-20`')
+    expect(row).toContain('`module/laws/src/b.cpp:30-40`')
+    expect(row).toContain('`int x;`')
+    expect(row).toContain('same body, no API change')
+    // A representative with no body says so, rather than leaving a blank cell to read as one.
+    expect(text.split('\n').find(line => line.startsWith('| `C002`'))!).toContain('| — |')
+  })
+
+  it('counts each priority in the overview, not only in the group headings', () => {
+    const text = renderReport(input({
+      assessments: new Map([
+        ['C001', { ...assessment('C001', 'patched'), priority: 'P0' }],
+        ['C002', { ...assessment('C002', 'report_only'), priority: 'P2' }],
+      ]),
+    }))
+    expect(text).toContain('各优先级 by priority: P0 1 / P1 0 / P2 1 / PX 0')
+  })
+
+  it('says why a failed attempt was not rolled back, instead of printing nothing', () => {
+    const failed: VerifyResult = {
+      attempt: 1, ok: false, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      rolled_back: false, rollback_files: [],
+      steps: [{ name: 'build', phase: 'build', command: 'msbuild t.sln', required: true, always: false, exit_code: 1, ok: false, timed_out: false, log_file: 'D:/runs/run-1/verify/1/1-build.log', lossy: false }],
+    }
+    const complete = new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]])
+    // A dirty baseline is the spec's documented suppression: there is no baseline worth
+    // restoring to, and a restore would destroy the operator's own uncommitted work.
+    const baseline = input()
+    const dirty = renderReport(input({
+      verify: [failed], assessments: complete,
+      run: { ...baseline.run, baseline: { head: 'abc123', branch: 'main', dirty: ['module/laws/src/user.cpp'] } },
+    }))
+    expect(dirty).toContain('未回滚 / not rolled back')
+    expect(dirty).toContain('基线不干净')
+    // The other documented suppression: the operator asked to keep the failed patch.
+    const kept = input({ verify: [failed], assessments: complete })
+    kept.run.settings = resolveSettings({
+      projectRoot: 'D:/gme',
+      verify: { keepFailedPatch: true, steps: [{ name: 'build', phase: 'build', command: 'msbuild t.sln' }] },
+    }).settings
+    expect(renderReport(kept)).toContain('未回滚 / not rolled back')
+    expect(renderReport(kept)).toContain('keepFailedPatch')
   })
 
   it('names the configured steps that did not run, so a skip cannot read as a smaller pipeline', () => {
@@ -138,6 +260,9 @@ describe('writeReport', () => {
   it('refuses to close a run while a cluster has no verdict', async () => {
     const target = await paths()
     await expect(writeReport(target, input())).rejects.toThrow(/C002 .*no verdict|no verdict.*C002/s)
+    // The refusal is before every write: a refused close leaves no artifact behind, so
+    // nothing can be mistaken for a report that was produced.
+    await expect(readFile(target.reportMd, 'utf8')).rejects.toThrow()
   })
 
   it('writes the three artifacts when the coverage contract holds', async () => {
@@ -168,6 +293,35 @@ describe('writeReport', () => {
     // disagrees with the return value is a run nobody can verify afterwards.
     expect(JSON.parse(await readFile(right.summary_path, 'utf8')).digest).toBe(right.digest)
     expect(await readFile(second.reportMd, 'utf8')).toBe(await readFile(first.reportMd, 'utf8'))
+  })
+
+  it('writes per-priority counts a caller can read without parsing Markdown', async () => {
+    const target = await paths()
+    const written = await writeReport(target, input({
+      assessments: new Map([
+        ['C001', { ...assessment('C001', 'patched'), priority: 'P0' }],
+        ['C002', { ...assessment('C002', 'report_only'), priority: 'P2' }],
+      ]),
+    }))
+    expect(written.summary.by_priority).toEqual({ P0: 1, P2: 1 })
+    expect(JSON.parse(await readFile(target.summaryJson, 'utf8')).by_priority).toEqual({ P0: 1, P2: 1 })
+  })
+
+  it('changes the digest when the report text changes', async () => {
+    const first = await paths()
+    const second = await paths()
+    // A constant 16-hex string would satisfy the format and equality checks; only
+    // sensitivity makes the digest a check on the text rather than a decoration.
+    const left = await writeReport(first, input({
+      assessments: new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]]),
+    }))
+    const right = await writeReport(second, input({
+      assessments: new Map([
+        ['C001', assessment('C001', 'patched')],
+        ['C002', { ...assessment('C002', 'report_only'), reason: 'a different reason' }],
+      ]),
+    }))
+    expect(right.digest).not.toBe(left.digest)
   })
 
   it('closes a partial run only when the caller accepts the gaps', async () => {
