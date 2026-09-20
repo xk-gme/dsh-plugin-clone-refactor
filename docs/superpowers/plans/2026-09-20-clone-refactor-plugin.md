@@ -19,6 +19,7 @@
 - 源码内导入使用 `.ts` 扩展名（`allowImportingTsExtensions`）；ESM only；所有文件 UTF-8 + LF 行尾。
 - 工具参数 schema 用 DSH 方言：每个属性写 `required: true`，枚举写 `enum: [...]`（见 Task 13）。
 - 每个任务结束时 `pnpm run verify` 必须退出码 0（`typecheck && build && test`）。
+- **提交时显式列出本任务创建/修改的文件，不要用 `git add -A`。** controller 的工作区里可能带着未提交的文档编辑，全仓 `add` 会把它们扫进你的任务提交，污染该任务的 review package（也把别人的工作记在你名下）。Task 11 与 Task 12 的实现者各自独立地避开了这个坑 —— 那是判断，不是规定；从 Task 13 起它是规定。
 
 ---
 
