@@ -850,6 +850,9 @@ export async function readJson<T>(file: string): Promise<T | undefined> {
 }
 ```
 
+> 注（Task 2 review 裁决 R15，**不要"简化"这段守卫**）：实现者曾报告 `assertInsideRoot` 的某个子句是死代码，reviewer 用探针证伪了它 —— 对 `runId = 'C:evil'`（盘符相对路径，且不含分隔符），
+> `resolve('D:/runs', 'C:evil')` 得到 `C:\evil`，而 `join(resolve('D:/runs'), 'C:evil')` 得到 `D:\runs\C:evil`，二者不同，于是只有 `resolve(...) !== join(...)` 这个子句能拦下它；删掉它（以及紧随其后的 `startsWith` 子句）会让 `'C:evil'` 通过，随后 `mkdir`/`writeFile` 以 `ENOENT` 在深处失败 —— 比干净拒绝糟糕得多。两个子句都必须保留。
+
 - [ ] **Step 4: 实现 `src/core/jsonl.ts`**
 
 ```ts
@@ -915,7 +918,7 @@ git commit -m "feat(core): add run paths, escape guard, atomic writes and append
 
 **Interfaces:**
 - Consumes: `RunPaths`（Task 2）、`appendJsonl` / `readJsonl`（Task 2）、`writeAtomic` / `readJson`（Task 2）
-- Produces: `VERDICTS`、`Verdict`、`ClonePairSide`、`ClonePair`、`Cluster`、`Assessment`、`PatchRecord`、`StepResult`、`VerifyResult`、`requireText(value, label)`、`loadAssessments(paths)`、`recordAssessment(paths, assessment, options)`、`loadPatches(paths)`、`savePatches(paths, patches)`、`coverageGaps(clusterIds, latest)`
+- Produces: `VERDICTS`、`Verdict`、`ClonePairSide`、`ClonePair`、`Cluster`、`Assessment`、`PatchRecord`、`StepResult`、`VerifyResult`、`requireText(value, label)`、`loadAssessments(paths)`、`recordAssessment(paths, assessment, options)`、`repairTornTail(file)`、`loadPatches(paths)`、`savePatches(paths, patches)`、`coverageGaps(clusterIds, latest)`
 
 - [ ] **Step 1: 写失败的账本测试**
 
@@ -926,7 +929,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runPaths } from '../src/core/artifacts.ts'
+import { runPaths, writeAtomic } from '../src/core/artifacts.ts'
+import { readJsonl } from '../src/core/jsonl.ts'
 import {
   coverageGaps, loadAssessments, loadPatches, recordAssessment, savePatches,
   requireText, type Assessment, type PatchRecord,
@@ -972,6 +976,27 @@ describe('assessments', () => {
     const { latest, droppedLines } = await loadAssessments(target)
     expect([...latest.keys()].sort()).toEqual(['C001', 'C002'])
     expect(droppedLines).toEqual([])
+  })
+
+  it('repairs a torn tail instead of letting it swallow the next record', async () => {
+    const target = await paths()
+    await recordAssessment(target, assessment('C001', 'report_only'), { replace: false })
+    // A crash mid-append leaves a fragment with no trailing newline. Without the
+    // repair the next append would glue onto it and readJsonl would drop BOTH.
+    await writeAtomic(target.assessments, `${JSON.stringify(assessment('C001', 'report_only'))}\n{"cluster_id":"C0`)
+    await recordAssessment(target, assessment('C002', 'skipped'), { replace: false })
+    const { records, droppedLines } = await readJsonl<Assessment>(target.assessments)
+    expect(droppedLines).toEqual([])
+    expect(records.map(record => record.cluster_id)).toEqual(['C001', 'C002'])
+  })
+
+  it('leaves a corrupt middle line alone for readJsonl to report', async () => {
+    const target = await paths()
+    // The tail is complete, so nothing is rewritten: the damage is reported, not hidden.
+    await writeAtomic(target.assessments, `${JSON.stringify(assessment('C001', 'report_only'))}\n{broken\n{"cluster_id":"C002","verdict":"skipped","priority":"PX","reason":"r","files_changed":[],"recorded_at":"2026-09-20T00:00:00.000Z"}\n`)
+    const { records, droppedLines } = await readJsonl<Assessment>(target.assessments)
+    expect(droppedLines).toEqual([2])
+    expect(records.map(record => record.cluster_id)).toEqual(['C001', 'C002'])
   })
 })
 
@@ -1092,7 +1117,14 @@ export function requireText(value: unknown, label: string): string {
  * The append-only ledger. Clusters live in `clusters.jsonl`, verdicts in
  * `assessments.jsonl`, and the authorization records in `patches.json`; the
  * coverage contract is "every cluster has exactly one latest verdict".
+ *
+ * `clusters.jsonl` is rewritten wholesale by a scan and `assessments.jsonl` is
+ * appended to; they are never both written to, so they need no shared writer
+ * discipline today. If a later task ever appends to `clusters.jsonl` while
+ * another rewrites it, revisit that: `writeAtomic`'s fixed `<file>.tmp` name and
+ * the read-modify-write race would both start to matter.
  */
+import { readFile } from 'node:fs/promises'
 import { appendJsonl, readJsonl } from './jsonl.ts'
 import { readJson, writeAtomic, type RunPaths } from './artifacts.ts'
 import type { Assessment, PatchRecord } from './schema.ts'
@@ -1120,6 +1152,26 @@ export async function loadAssessments(paths: RunPaths): Promise<LedgerRead> {
   return { latest, history: records, droppedLines }
 }
 
+/**
+ * A torn tail — a crash mid-append leaves a fragment with no trailing newline —
+ * would glue onto the next record and make `readJsonl` drop BOTH lines. The file's
+ * whole purpose is to survive an interrupted run, so repair it before appending.
+ * Only ever truncates a file whose last line is incomplete, and rewrites nothing
+ * else, so a corrupt *middle* line is left for `readJsonl` to report.
+ */
+export async function repairTornTail(file: string): Promise<boolean> {
+  let text: string
+  try {
+    text = await readFile(file, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+  if (text === '' || text.endsWith('\n')) return false
+  await writeAtomic(file, text.slice(0, text.lastIndexOf('\n') + 1))
+  return true
+}
+
 /** Append one verdict, refusing a silent overwrite of an existing cluster. */
 export async function recordAssessment(
   paths: RunPaths,
@@ -1131,6 +1183,7 @@ export async function recordAssessment(
   if (replaced && !options.replace) {
     throw new Error(`'${assessment.cluster_id}' already has a verdict. Pass replace: true to overwrite it.`)
   }
+  await repairTornTail(paths.assessments)
   await appendJsonl(paths.assessments, assessment)
   return { replaced }
 }
