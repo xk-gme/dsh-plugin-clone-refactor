@@ -4287,7 +4287,11 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         // 不该逼人放弃整个 run。
         const authorization = record.settings.authorization
         if (!authorization.enabled) throw new Error('Patching is disabled: set authorization.enabled: true in the profile row before any run may change source.')
-        if (PRIORITY_RANK[args.priority] < PRIORITY_RANK[authorization.maxPriority]) {
+        // `maxPriority` 是**严重度上限**：本部署允许被 patch 的**最不严重**的那一档。
+        // P0 的 rank 是 0，所以"到 P1 为止"意味着 rank ≤ 1。原来的 `<` 写反了 —— 在随包
+        // 默认值 `maxPriority: 'P0'` 下它什么都不拒绝（连 §8 明说不得重构的 PX 都放行），
+        // 而一旦生效，它禁止的反而是**更严重**的那些簇。R48。
+        if (PRIORITY_RANK[args.priority] > PRIORITY_RANK[authorization.maxPriority]) {
           throw new Error(`authorization.maxPriority is ${authorization.maxPriority}, so a ${args.priority} cluster may not be patched in this deployment.`)
         }
         if (files.length === 0) throw new Error('A patched verdict needs files_changed: the authorization ledger is what clone_verify reconciles against.')
@@ -4856,6 +4860,12 @@ describe('the whole chain', () => {
     const csv = join(root, 'func_clone_base.csv')
     await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
     const gitAndBuild: Array<[string, { stdout?: string; exitCode?: number }]> = [
+      // 本测试把 C001 判为 `report_only`，因此**不记录任何 patch**：授权账本为空，而
+      // reconcile 会拿 `[]` 去比 `git diff` 报的东西。GIT_OK 的 diff 回答里有一个文件名，
+      // 那会让本测试期望成功的验证步骤先被冻结 —— 所以先报一个干净的工作区（首个前缀匹配
+      // 生效，覆盖项必须写在前面）。
+      ['git status --porcelain', { stdout: '' }],
+      ['git diff --name-only', { stdout: '' }],
       ...GIT_OK,
       ['msbuild', { stdout: 'Build succeeded\n' }],
       ['tests.exe', { stdout: 'All tests passed\n' }],
@@ -4904,6 +4914,10 @@ describe('the whole chain', () => {
       artifactsRoot: join(root, 'runs'),
       detection: { provider: 'csv', csvPath: csv },
       authorization: { enabled: true },
+      // 本测试的前提是"有一个改动落在账本之外"，那就意味着工作区是脏的；而默认的
+      // `workdir.allowDirty: false` 会拒绝在脏工作区上开跑，于是 clone_scan 会在冻结
+      // 被观察到之前就失败。这里必须显式允许脏基线。
+      workdir: { allowDirty: true },
       verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
     }, fakeRunner([
       // 覆盖项必须写在 `...GIT_OK` **之前**：fakeRunner 返回首个前缀匹配，而 GIT_OK 里
