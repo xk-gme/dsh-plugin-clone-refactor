@@ -1793,7 +1793,7 @@ git commit -m "feat(git): add baseline capture and the authorization reconciliat
 
 **Interfaces:**
 - Consumes: `Settings`（Task 1）、`runPaths` / `defaultArtifactsRoot` / `assertInsideRoot` / `newRunId` / `writeAtomic` / `readJson`（Task 2）、`readBaseline` / `createBranch`（Task 5）、`CommandRunner`（Task 4）
-- Produces: `RunRecord`、`artifactsRootOf(settings, env?)`、`openRun(options)`、`loadRun(paths)`
+- Produces: `RunRecord`、`artifactsRootOf(settings, env?)`、`openRun(options)`、`loadRun(paths)`、`saveRun(paths, record, now?)`
 
 **分支规则（写进使用文档）**：`authorization.enabled` 为真时，建 run 时切到 `clone-refactor/<run_id>`；为假时不切分支（只读 run 不该动用户的 checkout），`run.json` 里记下当时的分支名。
 
@@ -4070,7 +4070,11 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       const job = await startJob(paths, runId, 'verify')
       detach(paths, job, async () => {
         const result = await runVerification({ runner, paths, steps: settings.verify.steps, cwd: record.project_root, attempt, signal: undefined })
-        if (!result.ok && !settings.verify.keepFailedPatch && authorized.length > 0) {
+        // 自动回滚只在干净基线上才安全。`workdir.allowDirty` 意味着操作者手上本来就有
+        // 未提交的工作：对被跟踪文件执行 `git restore --source=HEAD` 会抹掉他开跑前的
+        // 改动，对未跟踪文件执行 `git clean` 会删掉他开跑前就存在的文件。此时只记录
+        // 失败、把工作区原样留给他处理（`rolled_back: false` 会出现在报告里）。
+        if (!result.ok && !settings.verify.keepFailedPatch && authorized.length > 0 && record.baseline.dirty.length === 0) {
           await checkoutFiles(runner, record.project_root, authorized)
           result.rolled_back = true
           result.rollback_files = authorized
@@ -4772,7 +4776,7 @@ needs a Python checkout with libclang and, for type 3-4, an embeddings endpoint.
 另有两项**必须**写进使用文档，它们是设计里明确的边界而不是待办：
 
 - **运行范围**：`projectRoot` 必须是跟踪本次目标文件的**那个** git 仓库。目标在子模块内（如 `module/laws/**`）时指向该子模块本身；跨 superproject + submodule 的单次运行不在本期范围。写清"为什么"：主工程的 `git ls-files` / `status` / `diff` 看不到子模块内的文件，会直接导致授权对账判为未授权、分区回滚误判为"本次新建"。
-- **回滚语义**：验证失败且 `verify.keepFailedPatch` 为假时，插件分区回滚 —— 被跟踪的文件恢复到基线，**本次新建的文件会被删除**；任一步失败会抛错并体现在 job 记录与报告中，不会出现"报告说回滚了、实际没回滚"。
+- **回滚语义**：验证失败且 `verify.keepFailedPatch` 为假、**且基线干净**时，插件分区回滚 —— 被跟踪的文件恢复到基线，**本次新建的文件会被删除**；任一步失败会抛错并体现在 job 记录与报告中，不会出现"报告说回滚了、实际没回滚"。**开了 `workdir.allowDirty: true` 时不自动回滚**：操作者手上本来就有未提交的工作，恢复或删除都会毁掉它；此时只记录失败并把工作区原样留给他处理。
 
 首次自用的实测清单（必须照实写进文档，因为 GME 的构建命令在本计划中未经验证）：
 
