@@ -4456,6 +4456,10 @@ Expected: PASS
  * The packaged artefact must contain exactly what the plugin needs at runtime:
  * `lib/index.js` plus the patch layer. A missing patch file means a marketplace
  * install that silently does nothing.
+ *
+ * The READMEs are deliberately NOT asserted here: Task 15 creates them, and
+ * asserting a file that does not exist yet would fail this task for a reason
+ * this task cannot fix. Task 15 extends this list once they exist.
  */
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
@@ -4463,7 +4467,7 @@ import { readFileSync } from 'node:fs'
 const raw = execFileSync('npm', ['pack', '--dry-run', '--json'], { encoding: 'utf8', shell: process.platform === 'win32' })
 const [entry] = JSON.parse(raw)
 const files = entry.files.map(file => file.path.replaceAll('\\', '/'))
-for (const required of ['lib/index.js', 'cordis.patch.yml', 'README.md', 'LICENSE']) {
+for (const required of ['lib/index.js', 'cordis.patch.yml', 'LICENSE']) {
   if (!files.includes(required)) throw new Error(`the packaged artefact is missing ${required}`)
 }
 if (files.some(file => file.startsWith('docs/superpowers/'))) throw new Error('internal design docs must not be published')
@@ -4577,7 +4581,13 @@ needs a Python checkout with libclang and, for type 3-4, an embeddings endpoint.
 
 - [ ] **Step 3: 核对实现与文档的一致性**
 
-Run: `pnpm run verify`
+先把打包冒烟扩到双语 README（它们现在才存在），`tests/pack-smoke.mjs` 里的必需文件列表改成：
+
+```js
+for (const required of ['lib/index.js', 'cordis.patch.yml', 'LICENSE', 'README.md', 'README.zh.md']) {
+```
+
+然后 Run: `pnpm run verify`
 Expected: 退出码 0
 
 逐项确认（这就是本任务的验收）：
