@@ -3955,6 +3955,15 @@ git commit -m "feat(submit): commit, push and open a PR strictly by mode"
 
 ### Task 13: 六个工具与插件入口
 
+> **本节清单在实现时被修正了四处，全部是清单自身的缺陷（`3213047` 是权威实现）。** 逐字回写整份清单没有决策价值，而"把计划改成与产物一致"会毁掉它作为交叉校验的价值（R41），所以只记差异：
+>
+> 1. **导入符号不存在**：清单写 `import { normalizeRepoPath, reconcile } from './git/reconcile.ts'`，但 R6 裁决已把路径归一化落到 `core/paths.ts` 的 `normalizePath`，`git/reconcile.ts` 只导出 `reconcile` —— 该清单按字面 **TS2305 不能编译**。已就地改为分开导入。
+> 2. **测试的 `mount` 没有解构 `settings`** 就传给 `registerTools`，按字面不能通过。
+> 3. **第一个测试缺 `await settle(...)`**：它自己的注释要求轮询，但不轮询就去断言 `authorization.enabled` 的消息，此时扫描还没写出任何簇。
+> 4. **`GIT_OK` 缺 `['git checkout -B', …]`**：`authorization.enabled: true` 会让 `openRun` 建分支，未脚本化的命令使 `clone_scan` 在断言前失败。
+>
+> 另有两处实现时的必需调整：输出 schema 会推断出 `{keys} & Record<string, JsonValue>`，`JobRecord`/`ReportSummary` 无法满足，实现者加了 `asJson` 投影（并用深相等测试钉住无损）；以及实现者自查发现 **R27 与 R35 原本没有覆盖测试**，补上并对 R27 做了变异检验。
+
 **Files:**
 - Create: `src/tools.ts`
 - Replace: `src/index.ts`（**替换 Task 1 建立的最小桩**；`name`、永不抛错的 `apply` 契约保持不变，`inject` 扩为 `['tools', 'systemPrompt']`，`src/core/clusters.ts` 与 `src/verify/artifacts.ts` 同批创建）
@@ -4115,7 +4124,10 @@ import { assertInsideRoot, runPaths, writeAtomic } from './core/artifacts.ts'
 import { csvDetector } from './detect/csv.ts'
 import { pythonDetector } from './detect/python.ts'
 import { checkoutFiles, parseNameOnly, parsePorcelain } from './git/baseline.ts'
-import { normalizeRepoPath, reconcile } from './git/reconcile.ts'
+import { reconcile } from './git/reconcile.ts'
+// 路径归一化只有一份实现，在 Task 7 的 R6 裁决里落到 core/paths.ts（`git/reconcile.ts`
+// 只再导出 `reconcile`）。原清单写的 `normalizeRepoPath` 不存在，TS2305。
+import { normalizePath } from './core/paths.ts'
 import { loadUnauthorized, loadVerifyAttempts, readNewestVerifyLog } from './verify/artifacts.ts'
 import { writeReport } from './report/report.ts'
 import { renderCommitMessage, submit } from './submit.ts'
@@ -4894,10 +4906,15 @@ describe('the whole chain', () => {
       authorization: { enabled: true },
       verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
     }, fakeRunner([
-      ...GIT_OK,
-      // a.cpp is authorized; sneaky.cpp is not.
+      // 覆盖项必须写在 `...GIT_OK` **之前**：fakeRunner 返回首个前缀匹配，而 GIT_OK 里
+      // 已经有 `git status --porcelain` / `git diff --name-only` 条目，写在后面会被它们
+      // 遮蔽，测试于是永远看不到这两个"被改动的文件"，冻结逻辑根本不会被触发。
       ['git status --porcelain', { stdout: ' M module/laws/src/a.cpp\n M module/laws/src/sneaky.cpp\n' }],
       ['git diff --name-only', { stdout: 'module/laws/src/a.cpp\nmodule/laws/src/sneaky.cpp\n' }],
+      // `authorization.enabled: true` 会让 openRun 建 run 分支，因此需要一条脚本化的
+      // `git checkout -B`，否则 clone_scan 会在断言之前就因未脚本化的命令而失败。
+      ['git checkout -B', {}],
+      ...GIT_OK,
     ]))
     await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
     await settle(ctx, 'r1')
