@@ -7,10 +7,10 @@
  * recorded on the run and printed in the report, because two providers never
  * produce comparable cluster sets.
  */
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Settings } from '../config.ts'
-import { ensureDir } from '../core/artifacts.ts'
+import { ensureDir, writeAtomic } from '../core/artifacts.ts'
 import { assertCompleted } from '../git/baseline.ts'
 import { clustersFromRecords, hasCloneColumns, parseCsv, recordsOf } from './cluster.ts'
 import type { CloneDetector, DetectInput, DetectResult } from './provider.ts'
@@ -97,10 +97,12 @@ export function pythonDetector(): CloneDetector {
       // Keep the invocation next to its output, with the API key redacted — and
       // redact the captured streams too, not just the command line we composed.
       const secrets = [settings.detection.embeddingApiKey]
-      await writeFile(
+      // Through `writeAtomic`, like every other run-directory artefact: this file is
+      // named in the result's `artifacts`, so an interrupted scan must not leave a
+      // half-written invocation in its place.
+      await writeAtomic(
         join(paths.detectionDir, 'detect-command.txt'),
         redactText(`${redactArgv(argv, secrets).join(' ')}\nexit=${String(result.exitCode)}\n\n${result.stdout}\n${result.stderr}`, secrets),
-        'utf8',
       )
       if (result.exitCode !== 0 || result.timedOut) {
         // The shared MUTATING/started-command guard, not a bare `exitCode` check:

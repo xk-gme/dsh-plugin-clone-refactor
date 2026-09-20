@@ -57,6 +57,9 @@ function input(overrides: Partial<ReportInput> = {}): ReportInput {
     unauthorized: [],
     resolvedUnauthorized: [],
     unreadableRecords: [],
+    // The freeze claim is backed unless a test says the newest attempt left no
+    // reconcile record at all.
+    missingReconcileAttempt: undefined,
     notes: '',
     allowPartial: false,
     language: 'zh',
@@ -239,15 +242,55 @@ describe('renderReport', () => {
     expect(renderReport(kept)).toContain('keepFailedPatch')
   })
 
-  it('names the configured steps that did not run, so a skip cannot read as a smaller pipeline', () => {
+  it('names the configured steps from the attempt itself, so a mid-run edit cannot invent a skip', () => {
+    // The engine runs the LIVE `settings.verify.steps`, while the "not run" line used
+    // to be derived from the run SNAPSHOT. An operator who removes a step mid-run —
+    // an advertised flow — then got a step named as "skipped after an earlier
+    // failure" that the engine was never configured with, and a wrong count: a false
+    // CAUSE for a step that was deleted. The attempt's own record is what the engine
+    // actually ran against.
+    const verify: VerifyResult = {
+      attempt: 1, ok: false, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      rolled_back: false, rollback_files: [],
+      configured_steps: ['build'],
+      steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln', required: true, always: false, exit_code: 1, ok: false, timed_out: false, log_file: 'D:/runs/run-1/verify/1/1-build.log', lossy: false }],
+    }
+    const complete = new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]])
+    const removedMidRun = input({ verify: [verify], assessments: complete })
+    // The snapshot still holds the step the operator removed from the live list.
+    removedMidRun.run.settings = resolveSettings({
+      projectRoot: 'D:/gme',
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }, { name: 'test-debug', phase: 'test', command: 'tests.exe' }] },
+    }).settings
+    const text = renderReport(removedMidRun)
+    expect(text).not.toContain('test-debug')
+    expect(text).not.toContain('未执行')
+
+    // The mirror case: a step the operator ADDED mid-run was configured for this
+    // attempt and never ran, so it must still be named — from the attempt's record,
+    // not from the snapshot that no longer holds it.
+    const addedMidRun = input({
+      verify: [{ ...verify, configured_steps: ['build', 'test-debug'] }], assessments: complete,
+    })
+    addedMidRun.run.settings = resolveSettings({
+      projectRoot: 'D:/gme',
+      verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }] },
+    }).settings
+    const added = renderReport(addedMidRun)
+    expect(added).toContain('test-debug')
+    expect(added).toContain('本次共配置 2 步，实际执行 1 步')
+  })
+
+  it('falls back to the run snapshot for an attempt whose result predates the recorded step list', () => {
+    // Backwards compatibility: `configured_steps` is absent on a `result.json`
+    // written before the engine recorded it. The snapshot is then the only source
+    // left, and it must still be read rather than the line disappearing.
     const verify: VerifyResult = {
       attempt: 1, ok: false, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
       rolled_back: false, rollback_files: [],
       steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln', required: true, always: false, exit_code: 1, ok: false, timed_out: false, log_file: 'D:/runs/run-1/verify/1/1-build.log', lossy: false }],
     }
     const withSteps = input({ verify: [verify], assessments: new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]]) })
-    // The run's snapshot is what knows the full configured list; the attempt only has
-    // the steps that executed.
     withSteps.run.settings = resolveSettings({
       projectRoot: 'D:/gme',
       verify: { steps: [{ name: 'build', phase: 'build', command: 'msbuild tests.sln' }, { name: 'test-debug', phase: 'test', command: 'tests.exe' }] },
@@ -306,6 +349,41 @@ describe('renderReport', () => {
     expect(text).toMatch(/sneaky\.cpp/)
     expect(summarizeReport(resolved).unauthorized_files).toEqual([])
     expect(summarizeReport(resolved).resolved_unauthorized_files).toEqual(['module/laws/src/sneaky.cpp'])
+  })
+
+  it('says the newest attempt left no reconcile record instead of implying the run is clean', () => {
+    // The submit gate refuses when the newest attempt has NO reconcile record, while
+    // the freeze claim came from the newest attempt that HAD a readable one. Delete
+    // `reconcile.json` outright and the report printed no frozen section at all —
+    // which reads as "nothing was unauthorized" for a run the tooling will not
+    // submit. The report must name the missing record.
+    const failed: VerifyResult = {
+      attempt: 1, ok: false, started_at: '2026-09-20T00:00:00.000Z', finished_at: '2026-09-20T00:10:00.000Z',
+      rolled_back: false, rollback_files: [],
+      steps: [{ name: 'build', phase: 'build', command: 'msbuild t.sln', required: true, always: false, exit_code: 1, ok: false, timed_out: false, log_file: 'D:/runs/run-1/verify/1/1-build.log', lossy: false }],
+    }
+    const passed: VerifyResult = {
+      attempt: 2, ok: true, started_at: '2026-09-20T01:00:00.000Z', finished_at: '2026-09-20T01:10:00.000Z',
+      rolled_back: false, rollback_files: [],
+      steps: [{ name: 'build', phase: 'build', command: 'msbuild t.sln', required: true, always: false, exit_code: 0, ok: true, timed_out: false, log_file: 'D:/runs/run-1/verify/2/1-build.log', lossy: false }],
+    }
+    const complete = new Map([['C001', assessment('C001', 'patched')], ['C002', assessment('C002', 'report_only')]])
+    const text = renderReport(input({
+      verify: [failed, passed], assessments: complete,
+      // Attempt 2's reconcile.json is gone, so there is no newest reconcile to claim
+      // a freeze from — and none to call an older finding resolved, either.
+      unauthorized: [], resolvedUnauthorized: [],
+      missingReconcileAttempt: 2,
+    }))
+    expect(text).toContain('冻结状态未知')
+    expect(text).toContain('没有可读的 `reconcile.json`')
+    expect(text).toContain('attempt 2')
+    expect(text).toContain('clone_verify')
+    // The claims that must NOT be made: an unbacked "this run is not frozen", and a
+    // resolved-freeze section that would read as a clean bill of health.
+    expect(text).not.toContain('本 run 未被冻结')
+    expect(text).not.toContain('已解决的冻结')
+    expect(text).not.toContain('## 未授权改动')
   })
 
   it('names an unreadable job record instead of reporting an older job as the last one', () => {

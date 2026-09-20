@@ -326,6 +326,47 @@ describe('clone_assess authorization rules', () => {
     expect(rendered(verified)).toMatch(/module\/laws\/src\/a\.cpp/)
   })
 
+  it('keeps the OTHER authorized cluster when a patched cluster is retracted', async () => {
+    // The retraction writes the retained records, and every other fixture in this
+    // file holds exactly ONE live patch — so replacing `retained` with `[]` passes
+    // them all, dropping a live authorization nobody retracted. Two clusters are
+    // authorized here and only C001 is retracted, which is what makes the survivor
+    // observable.
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}`
+      + 'p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n'
+      + 'p2,module/laws/src/c.cpp,DrawShape,50-60,module/laws/src/d.cpp,PaintShape,70-80,0.9,type12\n')
+    const ctx = await mount({
+      projectRoot: 'D:/repo',
+      artifactsRoot: join(root, 'runs'),
+      detection: { provider: 'csv', csvPath: csv },
+      authorization: { enabled: true, maxClusters: 2 },
+    }, fakeRunner([['git checkout -B', { stdout: '' }], ...GIT_OK]))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+
+    const patched = (clusterId: string, file: string) => call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: clusterId, verdict: 'patched', priority: 'P0',
+      reason: 'bodies are identical', files_changed: [file],
+      evidence: { file, line: 12, snippet: 'static int area(const Rect& r)' },
+      confirm: true,
+    })
+    expect((await patched('C001', 'module/laws/src/a.cpp') as { isError?: boolean }).isError).not.toBe(true)
+    expect((await patched('C002', 'module/laws/src/c.cpp') as { isError?: boolean }).isError).not.toBe(true)
+    expect((await loadPatchesOf(root)).map(patch => patch.cluster_id)).toEqual(['C001', 'C002'])
+
+    const retracted = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'report_only', priority: 'P0',
+      reason: 'on reflection the callee is virtual', replace: true,
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'virtual void draw();' },
+    })
+    expect((retracted as { isError?: boolean }).isError, rendered(retracted)).not.toBe(true)
+
+    // C001 is gone and C002 — authorized, never retracted — is still there.
+    expect((await loadPatchesOf(root)).map(patch => patch.cluster_id)).toEqual(['C002'])
+  })
+
   it('requires evidence for a P0 report_only verdict', async () => {
     const root = await workspace()
     const csv = join(root, 'func_clone_base.csv')
@@ -1030,6 +1071,67 @@ describe('clone_report', () => {
     const findings = JSON.parse(await readFile(join(runDir, 'findings.json'), 'utf8')) as Array<Record<string, unknown>>
     expect(findings).toHaveLength(1)
     expect(findings[0]?.verdict).toBe('report_only')
+  })
+
+  it('carries a verdict\'s evidence into the ledger, findings.json and report.md', async () => {
+    // The evidence a model supplies is what justifies the verdict, and spec §11.2
+    // requires per-defect evidence (file, line, snippet). `clone_assess` already
+    // REFUSES a P0 report_only verdict without it — so a run could not close unless
+    // the evidence existed, and then discarded it: `Assessment` had no field for it,
+    // findings.json carried none of it, and the report printed only the reason. An
+    // operator could not audit why a cluster was skipped.
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({ projectRoot: 'D:/repo', artifactsRoot: join(root, 'runs'), detection: { provider: 'csv', csvPath: csv } }, fakeRunner(GIT_OK))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+
+    const evidence = { file: 'module/laws/src/a.cpp', line: 12, snippet: 'virtual void draw();  // dispatch is dynamic' }
+    const assessed = await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'report_only', priority: 'P0',
+      reason: 'the callee is virtual, so merging the bodies would change dispatch',
+      evidence,
+    })
+    expect((assessed as { isError?: boolean }).isError, rendered(assessed)).not.toBe(true)
+
+    // Read back through the public interface, i.e. from the file on disk: an
+    // in-memory copy would survive a write that never happened.
+    const ledger = JSON.parse(rendered(await call(ctx, 'clone_check', { run_id: 'r1', what: 'ledger' }))) as {
+      assessments: Array<{ cluster_id: string, evidence?: unknown }>
+    }
+    expect(ledger.assessments[0]?.evidence).toEqual(evidence)
+
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError, rendered(reported)).not.toBe(true)
+    const findings = JSON.parse(await readFile(join(root, 'runs', 'r1', 'findings.json'), 'utf8')) as Array<Record<string, unknown>>
+    expect(findings[0]?.evidence).toEqual(evidence)
+    const report = await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')
+    expect(report).toContain('module/laws/src/a.cpp:12')
+    expect(report).toContain('virtual void draw();  // dispatch is dynamic')
+  })
+
+  it('closes a run whose old verdicts carry no evidence at all', async () => {
+    // Backwards compatibility: a record written before `evidence` existed has no
+    // such field. A missing field means "not recorded" — it must not crash the
+    // render and must not be invented.
+    const root = await workspace()
+    const csv = join(root, 'func_clone_base.csv')
+    await writeFile(csv, `${CSV_HEADER}p1,module/laws/src/a.cpp,ComputeArea,10-20,module/laws/src/b.cpp,CalcArea,30-40,0.95,type12\n`)
+    const ctx = await mount({ projectRoot: 'D:/repo', artifactsRoot: join(root, 'runs'), detection: { provider: 'csv', csvPath: csv } }, fakeRunner(GIT_OK))
+    await call(ctx, 'clone_scan', { run_id: 'r1', module: 'base' })
+    await settle(ctx, 'r1')
+    await call(ctx, 'clone_assess', {
+      run_id: 'r1', cluster_id: 'C001', verdict: 'skipped', priority: 'PX', reason: 'out of scope',
+    })
+    // An older `assessments.jsonl` is simulated by the shape of the record itself:
+    // this verdict was written without an evidence field, exactly as a pre-existing
+    // run's record was.
+    const reported = await call(ctx, 'clone_report', { run_id: 'r1' })
+    expect((reported as { isError?: boolean }).isError, rendered(reported)).not.toBe(true)
+    const findings = JSON.parse(await readFile(join(root, 'runs', 'r1', 'findings.json'), 'utf8')) as Array<Record<string, unknown>>
+    expect(findings[0]?.evidence).toBeNull()
+    expect(await readFile(join(root, 'runs', 'r1', 'report.md'), 'utf8')).toContain('out of scope')
   })
 })
 

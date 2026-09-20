@@ -127,6 +127,21 @@ export interface UnauthorizedRead {
 }
 
 /**
+ * The freeze claim plus the two attempt numbers it rests on.
+ *
+ * `newestAttempt` and `reconciledAttempt` differ exactly when the newest attempt
+ * left no READABLE `reconcile.json` (deleted, or damaged), which is the fact
+ * `clone_submit` refuses on. The report needs it to say so instead of printing an
+ * unbacked "not frozen", and it cannot be recovered from `files`/`resolved` alone.
+ */
+export interface UnauthorizedStatus extends UnauthorizedRead {
+  /** The highest attempt DIRECTORY, whether or not it reconciled. */
+  newestAttempt: number | undefined
+  /** The newest attempt whose reconcile record is readable. */
+  reconciledAttempt: number | undefined
+}
+
+/**
  * The freeze claim, from the attempt the submit gate reads.
  *
  * The union of every attempt's audit claimed a freeze forever: the operator reverts
@@ -134,19 +149,33 @@ export interface UnauthorizedRead {
  * closed — and the report still says it is frozen and must not be verified. Every
  * other verdict in the report is newest-wins, and the claim has to be too. The older
  * findings are kept as `resolved` so the history stays auditable.
+ *
+ * `newestAttempt` is the highest attempt DIRECTORY. When the newest attempt recorded
+ * no readable reconcile, this claims NOTHING — neither a freeze nor a resolution:
+ * "an older finding the newest reconcile no longer repeats" is a statement about a
+ * newest reconcile, and there is none. Callers that only pass a map (a pure
+ * question about the audits themselves) get the historical behaviour, because the
+ * map's own newest key is then the only newest known.
  */
-export function unauthorizedClaim(audits: ReadonlyMap<number, ReconcileAudit>): UnauthorizedRead {
+export function unauthorizedClaim(audits: ReadonlyMap<number, ReconcileAudit>, newestAttempt?: number): UnauthorizedRead {
   const numbers = [...audits.keys()].sort((left, right) => left - right)
   const newest = numbers.at(-1)
   if (newest === undefined) return { files: [], resolved: [] }
+  if (newestAttempt !== undefined && newestAttempt !== newest) return { files: [], resolved: [] }
   const files = [...new Set(audits.get(newest)?.unauthorized ?? [])].sort()
   const older = new Set(numbers.filter(attempt => attempt !== newest).flatMap(attempt => audits.get(attempt)?.unauthorized ?? []))
   return { files, resolved: [...older].filter(file => !files.includes(file)).sort() }
 }
 
-/** The freeze claim of this run's verify attempts. */
-export async function loadUnauthorized(paths: RunPaths, onUnreadable?: UnreadableRecord): Promise<UnauthorizedRead> {
-  return unauthorizedClaim(await loadReconcileAudits(paths, onUnreadable))
+/** The freeze claim of this run's verify attempts, with the attempt it rests on. */
+export async function loadUnauthorized(paths: RunPaths, onUnreadable?: UnreadableRecord): Promise<UnauthorizedStatus> {
+  const audits = await loadReconcileAudits(paths, onUnreadable)
+  const newestAttempt = await newestAttemptNumber(paths)
+  return {
+    ...unauthorizedClaim(audits, newestAttempt),
+    newestAttempt,
+    reconciledAttempt: [...audits.keys()].sort((left, right) => left - right).at(-1),
+  }
 }
 
 /** The step index a log file name carries: the writer emits `${index}-${name}.log`. */

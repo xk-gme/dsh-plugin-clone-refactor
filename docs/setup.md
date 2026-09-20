@@ -241,13 +241,13 @@ One directory per run, `<artifactsRoot>/<run_id>/`, where `run_id` is `<YYYYMMDD
 | `run.json` | `run_id`, `project_root`, `baseline` (`head`, `branch`, `dirty`), `branch`, `original_branch`, `detection_provider`, `cluster_path`, `created_at`, `updated_at`, and the settings snapshot this run started with. `detection.embeddingApiKey` is stored as `[redacted]`, never in the clear (section 10) |
 | `clusters.jsonl` | The scan's clusters, one JSON object per line, each with its representative clone pair and the truncated bodies |
 | `assessments.jsonl` | The append-only verdict ledger, one record per verdict. A correction is a new line, and the newest line for a cluster wins |
-| `patches.json` | The authorization ledger: one record per currently `patched` cluster (`cluster_id`, `priority`, `files_changed`, `recorded_at`). Retracting a verdict removes its record |
+| `patches.json` | The authorization ledger: one record per currently `patched` cluster (`cluster_id`, `priority`, `files_changed`, `recorded_at`, and the `evidence` of the verdict behind it). Retracting a verdict removes its record |
 | `detection/` | The provider's own output: the pipeline's `func_clone_<module>.csv` and `detect-command.txt` (the invocation with the key redacted), or nothing for a `csv` scan whose report lives elsewhere |
-| `verify/<n>/` | One directory per attempt: `<index>-<step>.log` per step, `result.json` (the attempt's outcome, including `rolled_back` and `rollback_files`) and `reconcile.json` (authorized vs actually changed) |
-| `jobs/<job_id>.json` | The job records `clone_check` polls: `status` (`running` / `succeeded` / `failed`), `started_at`, `finished_at`, `error`, `summary` |
+| `verify/<n>/` | One directory per attempt: `<index>-<step>.log` per step, `result.json` (the attempt's outcome, including `rolled_back`, `rollback_files` and the `configured_steps` it was run with) and `reconcile.json` (authorized vs actually changed) |
+| `jobs/<job_id>.json` | The job records `clone_check` polls: `job_id`, `run_id`, `kind` (scan or verify), `status` (running / succeeded / failed), `started_at`, `finished_at`, `error`, `summary` |
 | `report.md` | The human report: overview, clusters grouped by priority with their evidence, coverage gaps, authorized changes, verification attempts, unauthorized changes, the last job, dropped ledger lines and your notes |
-| `findings.json` | The machine-readable cluster list with each cluster's verdict, priority, reason and authorized files |
-| `summary.json` | The counts: `clusters`, `recorded`, `missing`, `patched`, `report_only`, `skipped`, `by_priority`, `authorized_files`, `verify_attempts`, `verify_ok`, `unauthorized_files`, `unverified`, `dropped_lines`, plus the `digest` of the rendered report |
+| `findings.json` | The machine-readable cluster list with each cluster's verdict, priority, reason, `evidence` (file, line, snippet, or `null` when none was recorded) and authorized files |
+| `summary.json` | The counts: `run_id`, `baseline_head`, `detection_provider`, `cluster_path`, `clusters`, `recorded`, `missing`, `patched`, `report_only`, `skipped`, `by_priority`, `authorized_files`, `verify_attempts`, `verify_ok`, `unauthorized_files`, `resolved_unauthorized_files`, `unreadable_records`, `unverified`, `dropped_lines`, plus the `digest` of the rendered report |
 
 The default root is `$DSH_HOME/gme-clone-refactor/runs` (`~/.dsh/gme-clone-refactor/runs` when `DSH_HOME` is unset). Nothing outside it is ever written, except the patch the model applies to `projectRoot` and the rollback of the files that patch touched.
 

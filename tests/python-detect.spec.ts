@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -6,6 +6,17 @@ import { resolveSettings } from '../src/config.ts'
 import { runPaths } from '../src/core/artifacts.ts'
 import { buildDetectionArgv, pythonDetector, redactArgv, redactText } from '../src/detect/python.ts'
 import { fakeRunner } from './fixtures/fake-runner.ts'
+
+/**
+ * `writeAtomic` wrapped, not replaced: the real writer still does the work, so the
+ * other assertions here test real behaviour, and one test can observe that the
+ * redacted invocation went through it. A plain `writeFile` leaves a half-written
+ * `detect-command.txt`, which is the record of what the scan ran.
+ */
+vi.mock('../src/core/artifacts.ts', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/core/artifacts.ts')>()
+  return { ...actual, writeAtomic: vi.fn(actual.writeAtomic) }
+})
 
 const cleanups: Array<() => Promise<unknown>> = []
 afterEach(async () => { while (cleanups.length) await cleanups.pop()!() })
@@ -100,6 +111,21 @@ describe('pythonDetector', () => {
     expect(log).not.toContain('secret-key')
     expect(log).toContain('exit=0')
     expect(log).toContain('pipeline log')
+  })
+
+  it('writes the redacted invocation through the atomic writer, not a bare write', async () => {
+    const dir = await workspace()
+    const paths = runPaths(dir, 'r1')
+    const settings = resolveSettings({ projectRoot: 'D:/gme', detection: { pythonPath: 'py.exe', scriptPath: 'D:/agent/run.py' } }).settings
+    const { writeAtomic } = await import('../src/core/artifacts.ts')
+    vi.mocked(writeAtomic).mockClear()
+    // The CSV is missing, so the call fails AFTER writing the invocation — the write
+    // this test is about.
+    await expect(pythonDetector().detect({ settings, runner: fakeRunner([['py.exe', { stdout: 'ok\n' }]]), paths, module: 'base', csvPath: '', signal: undefined }))
+      .rejects.toThrow(/func_clone_base\.csv/)
+    const files = vi.mocked(writeAtomic).mock.calls.map(([file]) => file.replaceAll('\\', '/'))
+    expect(files.some(file => file.endsWith('/detection/detect-command.txt'))).toBe(true)
+    expect(await readFile(join(paths.detectionDir, 'detect-command.txt'), 'utf8')).toContain('exit=0')
   })
 
   it('fails with the pipeline log when the command exits non-zero', async () => {

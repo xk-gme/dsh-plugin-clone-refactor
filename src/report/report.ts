@@ -34,6 +34,17 @@ export interface ReportInput {
   resolvedUnauthorized: readonly string[]
   /** Durable records that could not be read at all: a skip must be visible. */
   unreadableRecords: readonly string[]
+  /**
+   * The newest attempt that has NO readable `reconcile.json`, when it is the newest
+   * attempt overall — the same record `clone_submit` refuses on. `undefined` means
+   * the freeze claim is backed (or that no attempt exists at all).
+   *
+   * Without it the report had no way to tell "the newest reconcile found nothing"
+   * from "there is no newest reconcile": deleting `reconcile.json` outright printed
+   * no frozen section at all, and an older attempt's finding could even be shown as
+   * resolved — a cleanliness claim about a run the tooling will not submit.
+   */
+  missingReconcileAttempt: number | undefined
   notes: string
   allowPartial: boolean
   language: 'zh' | 'en'
@@ -104,12 +115,26 @@ function snippetCell(pair: ClonePair): string {
   return `\`${cell(body.length > SNIPPET_CHARS ? `${body.slice(0, SNIPPET_CHARS)}…` : body)}\``
 }
 
+/**
+ * The evidence cell: `` `file:line` — snippet ``, or an em dash when the verdict
+ * was recorded without any.
+ *
+ * A verdict that NEEDED evidence (a patched one, or a P0 report_only one) cannot be
+ * recorded without it, so an em dash here means the record predates the field —
+ * "not recorded", which must not be dressed up as a justification. The snippet is
+ * passed through `cell`, because a snippet is source text and carries `|` routinely.
+ */
+function evidenceCell(evidence: Assessment['evidence']): string {
+  if (evidence === undefined) return '—'
+  return `\`${cell(`${evidence.file}:${String(evidence.line)}`)}\` — ${cell(evidence.snippet)}`
+}
+
 function clusterLine(cluster: Cluster, assessment: Assessment | undefined): string {
   const verdict = assessment?.verdict ?? 'MISSING'
   const priority = assessment?.priority ?? '-'
   const reason = assessment?.reason ?? 'no verdict recorded'
   const pair = cluster.representative
-  return `| \`${cell(cluster.id)}\` | ${cell(priority)} | ${cell(verdict)} | ${cluster.size} | ${sideCell(pair.left)} ↔ ${sideCell(pair.right)} | ${snippetCell(pair)} | ${cell(reason)} |`
+  return `| \`${cell(cluster.id)}\` | ${cell(priority)} | ${cell(verdict)} | ${cluster.size} | ${sideCell(pair.left)} ↔ ${sideCell(pair.right)} | ${snippetCell(pair)} | ${cell(reason)} | ${evidenceCell(assessment?.evidence)} |`
 }
 
 /**
@@ -200,7 +225,7 @@ export function renderReport(input: ReportInput): string {
   for (const group of groups) {
     if (group.clusters.length === 0) continue
     lines.push(`### ${group.title}（${group.clusters.length}）`, '',
-      '| 簇 | 优先级 | 判定 | 对数 | 代表对 | 片段 | 理由 |', '|---|---|---|---|---|---|---|',
+      '| 簇 | 优先级 | 判定 | 对数 | 代表对 | 片段 | 理由 | 证据 |', '|---|---|---|---|---|---|---|---|',
       ...group.clusters.map(cluster => clusterLine(cluster, input.assessments.get(cluster.id))), '')
   }
   if (gaps.length > 0) {
@@ -221,12 +246,16 @@ export function renderReport(input: ReportInput): string {
       }
       // The engine returns only the steps it executed, and StepResult has no `skipped`
       // field, so a reader could not otherwise tell "not configured" from "skipped after
-      // an earlier failure". The run's own settings snapshot carries the configured
-      // list, so the difference is derivable and must be shown — a report that silently
-      // omits a step nobody ran is the same lie as a hidden coverage gap. The defensive
-      // read also survives an older `run.json` whose settings shape predates this field.
+      // an earlier failure". The difference must therefore be shown — a report that
+      // silently omits a step nobody ran is the same lie as a hidden coverage gap.
       const ran = new Set(attempt.steps.map(step => step.name))
-      const configured = (input.run.settings?.verify?.steps ?? []).map(step => step.name)
+      // The step set the engine was CONFIGURED with, recorded on the attempt itself.
+      // Deriving it from `run.json`'s snapshot instead named a step the engine never
+      // had whenever the operator edited `verify.steps` mid-run — an advertised flow
+      // — and told the operator it was "skipped after an earlier failure", a false
+      // CAUSE for a step that was deleted. The snapshot is only the fallback for a
+      // `result.json` written before the engine recorded the list.
+      const configured = attempt.configured_steps ?? (input.run.settings?.verify?.steps ?? []).map(step => step.name)
       const notRun = configured.filter(name => !ran.has(name))
       if (notRun.length > 0) {
         lines.push('', `未执行 / not run: ${notRun.map(name => `\`${cell(name)}\``).join(', ')} —— 前序必需步骤失败后按规则跳过（本次共配置 ${configured.length} 步，实际执行 ${attempt.steps.length} 步）`)
@@ -246,7 +275,19 @@ export function renderReport(input: ReportInput): string {
       '- 这些文件被改动，但不在授权账本里；本 run 已冻结，不得验证或提交：',
       ...summary.unauthorized_files.map(file => `  - \`${file}\``), '')
   }
-  if (summary.resolved_unauthorized_files.length > 0) {
+  if (summary.unauthorized_files.length === 0 && input.missingReconcileAttempt !== undefined) {
+    // The freeze claim comes from the newest attempt's reconcile, so when that record
+    // is not there at all the report may claim NEITHER a freeze NOR cleanliness.
+    // Printing nothing (what it used to do) read as "nothing was unauthorized" for a
+    // run whose submit gate refuses on exactly this missing record; printing the
+    // resolved-freeze section below claimed an older finding was cleared by a
+    // reconcile that does not exist.
+    lines.push('## 冻结状态未知 / Freeze not recorded', '',
+      `- 最新一次验证（attempt ${input.missingReconcileAttempt}）没有可读的 \`reconcile.json\`，所以本 run 既不能被判定为已冻结，也不能被判定为干净：\`clone_submit\` 会拒绝提交。重新跑 \`clone_verify\` 把这个记录写出来。`,
+      `- 较早的 reconcile 记录（如果写过）仍在 \`verify/<n>/reconcile.json\` 下；本 run 的冻结判定只认最新一次。`,
+      '')
+  }
+  if (summary.unauthorized_files.length === 0 && input.missingReconcileAttempt === undefined && summary.resolved_unauthorized_files.length > 0) {
     // The freeze claim comes from the NEWEST reconcile audit, so an earlier finding
     // the newest attempt no longer repeats is history, not the run's state. Printing
     // it under the frozen heading made a finished, submitted run read as frozen.
@@ -294,6 +335,9 @@ export async function writeReport(paths: RunPaths, input: ReportInput): Promise<
     priority: input.assessments.get(cluster.id)?.priority ?? null,
     reason: input.assessments.get(cluster.id)?.reason ?? null,
     files_changed: input.assessments.get(cluster.id)?.files_changed ?? [],
+    // `null`, never a dropped key: the machine-readable half has to let a caller tell
+    // "no evidence was recorded" from "this field does not exist".
+    evidence: input.assessments.get(cluster.id)?.evidence ?? null,
   }))
   const digest = createHash('sha256').update(report).digest('hex').slice(0, 16)
   await writeAtomic(paths.reportMd, report)

@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resolveSettings } from '../src/config.ts'
+import { runPaths } from '../src/core/artifacts.ts'
 import { artifactsRootOf, loadRun, openRun, saveRun } from '../src/core/run.ts'
 import { fakeRunner } from './fixtures/fake-runner.ts'
 
@@ -79,6 +80,22 @@ describe('openRun', () => {
     const allowed = resolveSettings({ projectRoot: 'D:/repo', workdir: { allowDirty: true } }).settings
     const opened = await openRun({ settings: allowed, runner: fakeRunner(dirty), artifactsRoot, runId: 'run-5' })
     expect(opened.record.baseline.dirty).toEqual(['src/a.cpp'])
+  })
+
+  it('fails before switching the branch when the artifacts root cannot be written', async () => {
+    // `openRun` creates the run branch BEFORE it writes `run.json`. With an
+    // artifacts root that cannot be written (a full disk, a read-only path, here a
+    // path that is a regular file) the scan used to fail AFTER the switch, leaving
+    // the operator on a branch this plugin created and no run record to explain it.
+    const artifactsRoot = await root()
+    const notADirectory = join(artifactsRoot, 'runs')
+    await writeFile(notADirectory, 'not a directory', 'utf8')
+    const runner = fakeRunner(GIT_OK)
+    const { settings } = resolveSettings({ projectRoot: 'D:/repo', authorization: { enabled: true } })
+    await expect(openRun({ settings, runner, artifactsRoot: notADirectory, runId: 'run-7' })).rejects.toThrow()
+    // The whole point: the user's work tree was never touched.
+    expect(runner.calls.some(call => call.argv.join(' ') === 'git checkout -B clone-refactor/run-7')).toBe(false)
+    expect(await loadRun(runPaths(notADirectory, 'run-7'))).toBeUndefined()
   })
 
   it('rejects a run id that escapes the artifacts root', async () => {

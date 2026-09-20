@@ -277,6 +277,11 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       const assessment: Assessment = {
         cluster_id: clusterId, verdict: args.verdict, priority: args.priority, reason,
         files_changed: files, recorded_at: new Date().toISOString(),
+        // The evidence is the justification the caller supplied — and it reached NO
+        // durable artefact before this, even though a patched verdict and a P0
+        // report_only verdict cannot be recorded without it. Absent for a verdict
+        // that needs none: an invented empty record would be worse than none.
+        ...(args.evidence === undefined ? {} : { evidence: args.evidence }),
         // The revision this verdict speaks about. A later refresh changes the
         // revision, which is what makes this verdict stop covering the new set.
         ...(revision === undefined ? {} : { scan_revision: revision }),
@@ -295,6 +300,9 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
         const updated: PatchRecord = {
           cluster_id: clusterId, priority: args.priority,
           files_changed: files, recorded_at: assessment.recorded_at,
+          // The authorization carries the same evidence as the verdict behind it, so
+          // `patches.json` alone is enough to audit why a file was allowed to change.
+          ...(args.evidence === undefined ? {} : { evidence: args.evidence }),
           ...(revision === undefined ? {} : { scan_revision: revision }),
         }
         const existing = patches.findIndex(patch => patch.cluster_id === clusterId)
@@ -499,11 +507,16 @@ export function registerTools(ctx: Context, settings: Settings, runner: import('
       const job = await latestJob(paths, noteUnreadable)
       // The freeze claim is the newest attempt's, the same one the submit gate reads —
       // not the union of every attempt, which made a finished run read as frozen.
+      // `newestAttempt` and `reconciledAttempt` are what let the report say "there is
+      // no newest reconcile" instead of printing an unbacked "not frozen".
       const unauthorized = await loadUnauthorized(paths, noteUnreadable)
       const written = await writeReport(paths, {
         run: record, clusters, assessments: latest, patches, verify, job, droppedLines,
         unauthorized: unauthorized.files,
         resolvedUnauthorized: unauthorized.resolved,
+        missingReconcileAttempt: unauthorized.newestAttempt !== undefined && unauthorized.newestAttempt !== unauthorized.reconciledAttempt
+          ? unauthorized.newestAttempt
+          : undefined,
         unreadableRecords,
         notes: args.notes ?? '', allowPartial: args.allow_partial === true, language: settings.reportLanguage,
       })

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -6,6 +6,17 @@ import { runPaths } from '../src/core/artifacts.ts'
 import { runVerification, splitCommand } from '../src/verify/engine.ts'
 import type { VerifyStep } from '../src/config.ts'
 import { fakeRunner } from './fixtures/fake-runner.ts'
+
+/**
+ * `writeAtomic` wrapped, not replaced: the real writer still does the work, so every
+ * other assertion in this file tests real behaviour, and one test can observe that
+ * the STEP LOG went through it. A plain `writeFile` leaves a half-written file in
+ * the one artefact the model polls live (`clone_check what: 'log'`).
+ */
+vi.mock('../src/core/artifacts.ts', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/core/artifacts.ts')>()
+  return { ...actual, writeAtomic: vi.fn(actual.writeAtomic) }
+})
 
 const cleanups: Array<() => Promise<unknown>> = []
 afterEach(async () => { while (cleanups.length) await cleanups.pop()!() })
@@ -32,6 +43,10 @@ describe('runVerification', () => {
     })
     expect(result.ok).toBe(true)
     expect(result.steps.map(item => item.name)).toEqual(['build', 'test'])
+    // The step set the engine was CONFIGURED with, recorded on the attempt itself.
+    // The report derives "not run" from this rather than from `run.json`'s snapshot,
+    // which an operator may have edited since the attempt ran.
+    expect(result.configured_steps).toEqual(['build', 'test'])
     expect(result.rolled_back).toBe(false)
     const log = await readFile(join(target.verifyDir, '1', '1-build.log'), 'utf8')
     expect(log).toContain('msbuild tests.sln')
@@ -54,6 +69,9 @@ describe('runVerification', () => {
     })
     expect(result.ok).toBe(false)
     expect(result.steps.map(item => item.name)).toEqual(['build', 'restore-config'])
+    // Configured, not executed: the skipped `test` step is the one the report has to
+    // name, so recording only what ran would make the field useless for that.
+    expect(result.configured_steps).toEqual(['build', 'test', 'restore-config'])
     expect(result.steps[0]?.exit_code).toBe(1)
     expect(result.steps[0]?.ok).toBe(false)
     expect(result.steps[1]?.ok).toBe(true)
@@ -119,6 +137,22 @@ describe('runVerification', () => {
     expect(result.ok).toBe(true)
     expect(result.steps).toEqual([])
     expect(runner.calls).toEqual([])
+  })
+
+  it('writes each step log through the atomic writer, not a bare write', async () => {
+    // The step log is the live progress window: `clone_check what: 'log'` reads it
+    // WHILE the step runs, so a crash mid-write must not leave a half file where the
+    // previous content (or nothing) used to be. Every other run-directory artefact
+    // goes through `writeAtomic`; these two did not.
+    const target = await paths()
+    const { writeAtomic } = await import('../src/core/artifacts.ts')
+    vi.mocked(writeAtomic).mockClear()
+    const runner = fakeRunner([['msbuild', { stdout: 'built\n' }]])
+    await runVerification({ runner, paths: target, attempt: 1, cwd: 'D:/repo', signal: undefined, steps: [step('build', 'msbuild tests.sln')] })
+    const files = vi.mocked(writeAtomic).mock.calls.map(([file]) => file.replaceAll('\\', '/'))
+    expect(files.some(file => file.endsWith('/1/1-build.log'))).toBe(true)
+    // And the real writer still produced the log the other tests read.
+    expect(await readFile(join(target.verifyDir, '1', '1-build.log'), 'utf8')).toContain('built')
   })
 
   it('runs the steps in a caller-supplied work directory', async () => {

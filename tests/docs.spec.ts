@@ -23,6 +23,9 @@ import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import Tools from '@deepseek-ai/dsh-tools'
 import { apply, guidanceText, resolveSettings } from '../src/index.ts'
+import { runPaths } from '../src/core/artifacts.ts'
+import { startJob } from '../src/core/jobs.ts'
+import { writeReport } from '../src/report/report.ts'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -227,6 +230,66 @@ describe('the configuration reference in the two setup docs', () => {
         .map(match => match[1] as string))]
         .filter(key => !rows.has(key) && !known.has(key) && !looksLikeAFileName(key))
       expect(stray, `${file} mentions dotted keys outside its configuration tables: ${stray.join(', ')}`).toEqual([])
+    }
+  })
+})
+
+describe('the artifact field lists in the two setup docs', () => {
+  /**
+   * The section-6 row that describes one artifact, or `''` when the doc has none —
+   * and an empty string then fails the assertion below instead of matching nothing.
+   */
+  function artifactRow(text: string, name: string): string {
+    return text.split('\n').find(line => new RegExp(`^\\|\\s*\\\`${name.replaceAll('/', '\\/')}\\\`\\s*\\|`).test(line)) ?? ''
+  }
+
+  /**
+   * The fields a row lists, and only the fields: a row also names a tool
+   * (`clone_check`) and a file (`jobs/<job_id>.json`), so a backticked token that is
+   * not an identifier, or that is a `clone_*` tool name, is not a field. Values are
+   * written as plain words in these two rows precisely so this stays exact.
+   */
+  function documentedFields(row: string): string[] {
+    return [...new Set([...row.matchAll(/`([a-z_][a-z0-9_]*)`/g)].map(match => match[1] as string))]
+      .filter(name => !name.startsWith('clone_'))
+      .sort()
+  }
+
+  it('names exactly the fields summary.json and a job record really carry', async () => {
+    // Read from the ARTIFACTS, not from the interfaces: a hand-written list cannot
+    // drift from a file the code actually wrote, which is what these two doc lists
+    // describe. `writeReport` needs no clusters to produce a summary, so the fixture
+    // is minimal and cannot itself become the thing that drifts.
+    const root = await mkdtemp(join(tmpdir(), 'clone-docs-artifacts-'))
+    cleanups.push(() => rm(root, { recursive: true, force: true }))
+    const pathsOfRun = runPaths(root, 'run-1')
+    await writeReport(pathsOfRun, {
+      run: {
+        run_id: 'run-1', project_root: 'D:/gme', baseline: { head: 'abc123', branch: 'main', dirty: [] },
+        branch: 'clone-refactor/run-1', original_branch: 'main', detection_provider: 'csv', cluster_path: 'inline',
+        created_at: '2026-09-20T00:00:00.000Z', updated_at: '2026-09-20T00:00:00.000Z',
+        settings: resolveSettings({}).settings,
+      },
+      clusters: [], assessments: new Map(), patches: [], verify: [], job: undefined,
+      droppedLines: [], unauthorized: [], resolvedUnauthorized: [],
+      unreadableRecords: [], missingReconcileAttempt: undefined,
+      notes: '', allowPartial: false, language: 'zh',
+    })
+    const summaryFields = Object.keys(JSON.parse(await readFile(pathsOfRun.summaryJson, 'utf8')) as object).sort()
+    const jobFields = Object.keys(await startJob(pathsOfRun, 'run-1', 'scan', new Date('2026-09-20T01:00:00Z'))).sort()
+    // Positive controls: an artifact that suddenly carried two fields would make the
+    // comparisons below trivially true, so the lists have to stay the size they are.
+    expect(summaryFields.length).toBeGreaterThan(15)
+    expect(jobFields.length).toBeGreaterThan(5)
+
+    for (const file of ['docs/setup.md', 'docs/setup.zh.md']) {
+      const text = await readFile(join(ROOT, file), 'utf8')
+      const summaryRow = artifactRow(text, 'summary.json')
+      expect(summaryRow, `${file} has no summary.json row`).not.toBe('')
+      expect(documentedFields(summaryRow), `${file}'s summary.json field list`).toEqual(summaryFields)
+      const jobRow = artifactRow(text, 'jobs/<job_id>.json')
+      expect(jobRow, `${file} has no job-record row`).not.toBe('')
+      expect(documentedFields(jobRow), `${file}'s job-record field list`).toEqual(jobFields)
     }
   })
 })

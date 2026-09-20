@@ -85,6 +85,22 @@ describe('job records', () => {
     expect((await latestJob(target))?.job_id).toBe(expected)
   })
 
+  it('orders by start time first, so an earlier job with a GREATER id is not the newest', async () => {
+    // `latestJob` orders by `started_at` with `job_id` as the tiebreak. An
+    // implementation that sorted by `job_id` ALONE passed every other fixture here,
+    // because a job id embeds its own timestamp and the kind letter happened to order
+    // the same way. These two disagree on purpose: the EARLIER job's id sorts after
+    // the later one's, so only the primary key can pick the right answer.
+    const target = await paths()
+    const earlier = await startJob(target, 'run-1', 'verify', new Date('2026-09-20T01:00:00Z'))
+    const later = await startJob(target, 'run-1', 'scan', new Date('2026-09-20T02:00:00Z'))
+    // The disagreement is what makes this case discriminating, and it is asserted
+    // rather than assumed: if the ids ever agreed, the test below would pass for the
+    // wrong reason.
+    expect([earlier.job_id, later.job_id].sort().at(-1)).toBe(earlier.job_id)
+    expect((await latestJob(target))?.job_id).toBe(later.job_id)
+  })
+
   it('polls past a corrupt job file instead of failing every read', async () => {
     const target = await paths()
     const good = await startJob(target, 'run-1', 'scan', new Date('2026-09-20T01:00:00Z'))

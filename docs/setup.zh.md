@@ -241,13 +241,13 @@ node $dsh web
 | `run.json` | `run_id`、`project_root`、`baseline`（`head`、`branch`、`dirty`）、`branch`、`original_branch`、`detection_provider`、`cluster_path`、`created_at`、`updated_at`，以及本次 run 启动时的配置快照。`detection.embeddingApiKey` 存为 `[redacted]`，绝不落明文（第 10 节） |
 | `clusters.jsonl` | 扫描得到的簇，一行一个 JSON 对象，每个簇带代表克隆对与截断后的函数体 |
 | `assessments.jsonl` | 追加写的判定账本，一条判定一行。修正判定就是新写一行，同一簇以最后一行为准 |
-| `patches.json` | 授权账本：每个当前处于 `patched` 的簇一条记录（`cluster_id`、`priority`、`files_changed`、`recorded_at`）。撤回判定会删掉对应记录 |
+| `patches.json` | 授权账本：每个当前处于 `patched` 的簇一条记录（`cluster_id`、`priority`、`files_changed`、`recorded_at`，以及该判定所依据的 `evidence`）。撤回判定会删掉对应记录 |
 | `detection/` | 检测路径自己的产物：管线的 `func_clone_<module>.csv` 与 `detect-command.txt`（已脱敏的调用行）；`csv` 扫描的报告在别处时这里可以为空 |
-| `verify/<n>/` | 每次尝试一个目录：每步一份 `<序号>-<步骤>.log`、`result.json`（本次尝试的结论，含 `rolled_back` 与 `rollback_files`）与 `reconcile.json`（授权文件 vs 实际改动） |
-| `jobs/<job_id>.json` | `clone_check` 轮询的 job 记录：`status`（`running` / `succeeded` / `failed`）、`started_at`、`finished_at`、`error`、`summary` |
+| `verify/<n>/` | 每次尝试一个目录：每步一份 `<序号>-<步骤>.log`、`result.json`（本次尝试的结论，含 `rolled_back`、`rollback_files` 与本次运行的 `configured_steps`）与 `reconcile.json`（授权文件 vs 实际改动） |
+| `jobs/<job_id>.json` | `clone_check` 轮询的 job 记录：`job_id`、`run_id`、`kind`（scan 或 verify）、`status`（running / succeeded / failed）、`started_at`、`finished_at`、`error`、`summary` |
 | `report.md` | 人读报告：概览、按优先级分组的簇及其证据、覆盖缺口、已授权改动、验证尝试、未授权改动、最后的 job、跳过的账本行与你的备注 |
-| `findings.json` | 机器可读的簇清单，每簇带判定、优先级、理由与已授权文件 |
-| `summary.json` | 计数：`clusters`、`recorded`、`missing`、`patched`、`report_only`、`skipped`、`by_priority`、`authorized_files`、`verify_attempts`、`verify_ok`、`unauthorized_files`、`unverified`、`dropped_lines`，以及渲染报告内容的 `digest` |
+| `findings.json` | 机器可读的簇清单，每簇带判定、优先级、理由、`evidence`（文件、行号、片段；未记录时为 `null`）与已授权文件 |
+| `summary.json` | 计数：`run_id`、`baseline_head`、`detection_provider`、`cluster_path`、`clusters`、`recorded`、`missing`、`patched`、`report_only`、`skipped`、`by_priority`、`authorized_files`、`verify_attempts`、`verify_ok`、`unauthorized_files`、`resolved_unauthorized_files`、`unreadable_records`、`unverified`、`dropped_lines`，以及渲染报告内容的 `digest` |
 
 默认根目录是 `$DSH_HOME/gme-clone-refactor/runs`（未设 `DSH_HOME` 时即 `~/.dsh/gme-clone-refactor/runs`）。该目录之外不会写入任何东西，除了模型在 `projectRoot` 上打的 patch，以及该 patch 触及文件的回滚。
 

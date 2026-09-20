@@ -155,6 +155,22 @@ describe('loadUnauthorized', () => {
     expect(read.resolved).toEqual(['module/laws/src/sneaky.cpp'])
   })
 
+  it('reports nothing as resolved when the newest attempt has no reconcile record', async () => {
+    // Attempt 2 ran (its result.json is there) but its `reconcile.json` is gone. The
+    // freeze claim used to come from the newest attempt that HAD an audit, so
+    // attempt 1's finding was reported as "resolved" — a cleanliness claim about a
+    // run whose newest attempt recorded nothing, and which `clone_submit` refuses.
+    const target = await paths()
+    await writeAtomic(join(target.verifyDir, '1', 'reconcile.json'), `${JSON.stringify(audit(['module/laws/src/sneaky.cpp']))}\n`)
+    await writeAtomic(join(target.verifyDir, '2', 'result.json'), `${JSON.stringify(result(2))}\n`)
+    const read = await loadUnauthorized(target)
+    expect(read.newestAttempt).toBe(2)
+    expect(read.reconciledAttempt).toBe(1)
+    // Neither a freeze nor a clean bill of health: there is nothing newest to claim.
+    expect(read.files).toEqual([])
+    expect(read.resolved).toEqual([])
+  })
+
   it('still reports the freeze when the newest attempt is the one that found it', async () => {
     const target = await paths()
     await writeAtomic(join(target.verifyDir, '1', 'reconcile.json'), `${JSON.stringify(audit([]))}\n`)

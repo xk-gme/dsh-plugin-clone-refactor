@@ -87,6 +87,16 @@ function assertTrustworthy(result: CommandResult, context: string): void {
  * outward commands (`git add`, `git commit`, `git push`, `gh pr create`) and
  * `detect/python.ts` starts the detection pipeline. Both judge their child the
  * same way, so the guard lives in one place rather than being copied.
+ *
+ * WHAT THIS GUARD DOES NOT SHARE is its message. The non-timeout branch embeds the
+ * command's captured output (`detail(result)`), which is harmless for the git
+ * commands above — their stderr is a git diagnostic — and a CREDENTIAL LEAK for any
+ * caller whose command carries a secret on its own argv or may echo one. The
+ * detection child is exactly that: it is started with `--embedding-commercial-api-key
+ * <key>`, and a pipeline that echoes its argv writes the key to stderr, so reusing
+ * `detail` verbatim would put the key into the thrown error and every log of it.
+ * Such a caller must ask this guard only for its timeout verdict and rebuild its own
+ * refusal from the redacted detail — `src/detect/python.ts` is the pattern.
  */
 export function assertCompleted(result: CommandResult, context: string): void {
   if (result.exitCode === 0 && !result.timedOut) return

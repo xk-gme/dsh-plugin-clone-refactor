@@ -3,9 +3,10 @@
  * that binding the authorization reconciliation cannot tell this run's edits
  * from the user's own, and every later tool must keep using the same pair.
  */
-import { resolve } from 'node:path'
+import { rm, stat } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 import type { DetectionProvider, Settings } from '../config.ts'
-import { assertInsideRoot, defaultArtifactsRoot, newRunId, readJson, runPaths, writeAtomic, type RunPaths } from './artifacts.ts'
+import { assertInsideRoot, defaultArtifactsRoot, ensureDir, newRunId, readJson, runPaths, writeAtomic, type RunPaths } from './artifacts.ts'
 import type { CommandRunner } from './command.ts'
 import { createBranch, readBaseline, type Baseline } from '../git/baseline.ts'
 
@@ -99,6 +100,36 @@ export interface OpenedRun {
 }
 
 /**
+ * Establish that this run's own directory accepts a write, BEFORE anything switches
+ * the user's work tree.
+ *
+ * `openRun` used to run `git checkout -B clone-refactor/<id>` and only afterwards
+ * write `run.json`. With an artifacts root that cannot be written — a full disk, a
+ * read-only path — the scan therefore failed AFTER the branch switch, leaving
+ * exactly the half state the design forbids: the operator's work tree moved onto a
+ * branch, and no run record to explain it or to resume from.
+ *
+ * The probe is a real `writeAtomic`, so it fails for every reason the record write
+ * would rather than for a permission bit alone. It is removed again; a directory
+ * this call had to create is removed too when the write fails, so a failure leaves
+ * nothing behind, while a directory that already existed is left exactly as it was.
+ */
+async function prepareRunDir(dir: string): Promise<void> {
+  const existed = await stat(dir).then(() => true).catch(() => false)
+  await ensureDir(dir)
+  const probe = join(dir, `.write-probe-${String(process.pid)}`)
+  try {
+    await writeAtomic(probe, '')
+  } catch (error) {
+    if (!existed) await rm(dir, { recursive: false, force: true }).catch(() => undefined)
+    throw error
+  }
+  // Best-effort: the write above already proved the directory is writable, and a
+  // stray probe file is not a run record (nothing reads anything but `run.json`).
+  await rm(probe, { force: true }).catch(() => undefined)
+}
+
+/**
  * Create a run, or resume the one with this id. Resuming never re-reads the
  * baseline: the whole point of the record is that it is fixed at creation.
  */
@@ -121,6 +152,10 @@ export async function openRun(options: OpenRunOptions): Promise<OpenedRun> {
     )
   }
   const branch = settings.authorization.enabled ? `clone-refactor/${runId}` : baseline.branch
+  // The run directory must be writable BEFORE the branch is switched, or a failure
+  // to write `run.json` would leave the user on a branch this plugin created and no
+  // record of why (see `prepareRunDir`).
+  await prepareRunDir(paths.dir)
   if (settings.authorization.enabled) await createBranch(runner, settings.projectRoot, branch)
   const stamp = (options.now ?? new Date()).toISOString()
   const record: RunRecord = {

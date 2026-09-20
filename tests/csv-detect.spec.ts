@@ -64,6 +64,29 @@ describe('csvDetector', () => {
       .rejects.toThrow(/file2/)
   })
 
+  it('prefers the caller\'s csv_path over detection.csvPath when both are set', async () => {
+    // The documented precedence, and the only case that can see it: every other test
+    // here leaves one of the two sides empty, so REVERSING the order passes them all.
+    // The two reports name different files, so the one that answered is readable off
+    // the clusters rather than off an internal call.
+    const dir = await scratch()
+    const explicit = join(dir, 'explicit.csv')
+    const configured = join(dir, 'configured.csv')
+    const header = 'pair_id,file1,func1_name,lines1,file2,func2_name,lines2,similarity,detection_method\n'
+    await writeFile(explicit, `${header}p1,explicit-a.cpp,f,1-2,explicit-b.cpp,g,3-4,0.9,type12\n`)
+    await writeFile(configured, `${header}p2,configured-a.cpp,f,1-2,configured-b.cpp,g,3-4,0.9,type12\n`)
+    const result = await csvDetector().detect({
+      settings: resolveSettings({ projectRoot: 'D:/gme', detection: { csvPath: configured } }).settings,
+      runner: fakeRunner([]),
+      paths: runPaths(dir, 'r1'),
+      module: '',
+      csvPath: explicit,
+      signal: undefined,
+    })
+    expect(result.clusters[0]?.files).toEqual(['explicit-a.cpp', 'explicit-b.cpp'])
+    expect(result.artifacts).toEqual([explicit])
+  })
+
   it('names the file it refused, so the operator knows which report it read', async () => {
     const error = await detect('a,b\n1,2\n').then(() => undefined, (caught: unknown) => caught as Error)
     expect(error?.message).toContain('func_clone_base.csv')

@@ -103,6 +103,20 @@ describe('submit', () => {
     ])
   })
 
+  it('opens the pull request against a configured base that is not main', async () => {
+    // Both `pr` cases above leave the base at `main`, so hard-coding `'main'` in
+    // `submit` passes every one of them and the documented `submit.baseBranch` is
+    // inert. The whole argv is compared, so a `gh pr create` that ignores the
+    // configured branch fails here rather than on a `toContain('--base')` that any
+    // value would satisfy.
+    const runner = fakeRunner([ON_RUN_BRANCH, ['git add', {}], ['git commit', {}], ['git push', {}], ['gh pr create', { stdout: 'https://github.com/x/y/pull/9\n' }]])
+    await submit({ ...BASE, runner, mode: 'pr', baseBranch: 'develop' })
+    expect(runner.calls[4]?.argv).toEqual([
+      'gh', 'pr', 'create', '--base', 'develop', '--head', 'clone-refactor/run-1',
+      '--title', 'Clone refactor run-1', '--body', 'Deduplicated one clone family.',
+    ])
+  })
+
   it('falls back to main when no base branch is configured', async () => {
     // `submit.baseBranch` defaults to '' in the shipped config, so this is the path
     // every unconfigured user takes — not a dead branch.

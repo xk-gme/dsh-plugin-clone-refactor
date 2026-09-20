@@ -55,6 +55,18 @@ describe('assessments', () => {
     expect(droppedLines).toEqual([])
   })
 
+  it('round-trips the evidence a verdict was recorded with', async () => {
+    const target = await paths()
+    const evidence = { file: 'module/laws/src/a.cpp', line: 12, snippet: 'virtual void draw();' }
+    await recordAssessment(target, { ...assessment('C001', 'report_only'), evidence }, { replace: false })
+    // A record written before the field existed carries none: "not recorded" must
+    // stay distinguishable from an invented value, and must not upset the reader.
+    await recordAssessment(target, assessment('C002', 'skipped'), { replace: false })
+    const { latest } = await loadAssessments(target)
+    expect(latest.get('C001')?.evidence).toEqual(evidence)
+    expect(latest.get('C002')?.evidence).toBeUndefined()
+  })
+
   it('repairs a torn tail instead of letting it swallow the next record', async () => {
     const target = await paths()
     await recordAssessment(target, assessment('C001', 'report_only'), { replace: false })
@@ -83,6 +95,8 @@ describe('patches', () => {
     const patches: PatchRecord[] = [{
       cluster_id: 'C003', priority: 'P0', files_changed: ['module/laws/src/a.cpp'],
       recorded_at: '2026-09-20T00:00:00.000Z',
+      // The authorization carries the same evidence as the verdict it records.
+      evidence: { file: 'module/laws/src/a.cpp', line: 12, snippet: 'static int area(const Rect& r)' },
     }]
     await savePatches(target, patches)
     expect(await loadPatches(target)).toEqual(patches)

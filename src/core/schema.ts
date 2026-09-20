@@ -31,6 +31,22 @@ export interface Cluster {
   functions: string[]
 }
 
+/**
+ * The concrete justification of a verdict: the file, the line and the snippet that
+ * makes it checkable. Spec §11.2 requires per-defect evidence, so a verdict that
+ * needs one cannot be recorded without it — and it must then reach the durable
+ * artefacts (`assessments.jsonl`, `patches.json`, `findings.json`, `report.md`)
+ * rather than being validated and discarded.
+ *
+ * Optional everywhere it is stored: a record written before this existed has no
+ * such field, and "not recorded" must stay distinguishable from an invented value.
+ */
+export interface Evidence {
+  file: string
+  line: number
+  snippet: string
+}
+
 export interface Assessment {
   cluster_id: string
   verdict: Verdict
@@ -38,6 +54,8 @@ export interface Assessment {
   reason: string
   files_changed: string[]
   recorded_at: string
+  /** The evidence this verdict was justified with; absent on older records. */
+  evidence?: Evidence
   /**
    * The scan revision this verdict was recorded against. Cluster ids are
    * positional, so after a refresh a verdict from an earlier revision must not
@@ -53,6 +71,8 @@ export interface PatchRecord {
   priority: Priority
   files_changed: string[]
   recorded_at: string
+  /** The evidence the verdict behind this authorization carried; absent before it existed. */
+  evidence?: Evidence
   /** The scan revision this authorization belongs to; see {@link Assessment.scan_revision}. */
   scan_revision?: string
 }
@@ -76,6 +96,19 @@ export interface VerifyResult {
   started_at: string
   finished_at: string
   steps: StepResult[]
+  /**
+   * The step names this attempt was CONFIGURED to run, in order — the list the
+   * engine actually iterated, which is the LIVE `verify.steps` at the moment the
+   * attempt ran, not `run.json`'s snapshot.
+   *
+   * The report's "not run" line needs this: `steps` holds only what executed, so
+   * without the configured set a step could only be derived from the snapshot, and
+   * an operator who edits `verify.steps` mid-run (an advertised flow) got a step
+   * named as "skipped after an earlier failure" that this attempt never had, plus a
+   * wrong configured count. Absent on records written before the engine recorded
+   * it; the report then falls back to the snapshot.
+   */
+  configured_steps?: string[]
   rolled_back: boolean
   rollback_files: string[]
   /**

@@ -9,10 +9,10 @@
  * is not ported either — the backend needed a `compile-fixer` strategy because it
  * was unattended, while here the model reads the log itself.
  */
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { VerifyStep } from '../config.ts'
-import type { RunPaths } from '../core/artifacts.ts'
+import { writeAtomic, type RunPaths } from '../core/artifacts.ts'
 import type { CommandRunner } from '../core/command.ts'
 import type { StepResult, VerifyResult } from '../core/schema.ts'
 
@@ -90,7 +90,10 @@ export async function runVerification(options: EngineOptions): Promise<VerifyRes
       lossy: result.lossy,
     }
     await mkdir(attemptDir, { recursive: true })
-    await writeFile(stepResult.log_file, renderLog(step, stepResult, options.cwd, result.stdout, result.stderr, result.spillPath, result.signal), 'utf8')
+    // `writeAtomic`, like every other run-directory artefact: this file is exactly
+    // what the model polls live through `clone_check what: 'log'`, so a reader must
+    // never find a half-written log in place of the previous step's.
+    await writeAtomic(stepResult.log_file, renderLog(step, stepResult, options.cwd, result.stdout, result.stderr, result.spillPath, result.signal))
     results.push(stepResult)
     // Only a required step can fail the run: an optional step that fails is
     // bookkeeping, not evidence about the patch. An `always` step that fails is
@@ -109,6 +112,10 @@ export async function runVerification(options: EngineOptions): Promise<VerifyRes
     started_at: startedAt,
     finished_at: now().toISOString(),
     steps: results,
+    // The set this attempt was configured with, recorded on the attempt itself: the
+    // report derives "not run" from these two fields, so it stays truthful about a
+    // run whose `verify.steps` the operator edited after this attempt ran.
+    configured_steps: options.steps.map(step => step.name),
     rolled_back: false,
     rollback_files: [],
   }
