@@ -19,6 +19,36 @@ Community plugin, not an official DeepSeek package.
 
 Every cluster the scan produces must end with a verdict before the run can close; `clone_report` refuses the rest unless the caller accepts `allow_partial: true`, which puts the gaps in the report instead of dropping them.
 
+## How it works
+
+The data flow of one run:
+
+```
+func_clone CSV (already existing, or produced by the python pipeline)
+      ↓  function pairs: both sides' file / function / lines / snippet
+         + similarity + detection-method mark
+ connected components → clone families (one representative pair each)
+      ↓  the model reads the real source and judges every family
+         (patched / report_only / skipped)
+ patched + user confirm → the authorization ledger
+         (the only list of files that may be changed)
+      ↓  reconcile (real git diff vs the ledger) → run the build / test
+         steps you configured
+ passed and the ledger unchanged → commit only the ledger's files → report
+```
+
+**Detection.** A "clone" is a pair of highly similar functions in one module. The plugin ships no detector of its own: the `csv` route reads a `func_clone_<module>.csv` GME already produced, and the `python-pipeline` route drives the existing `run_gme_clone_detection.py` (libclang-based) to produce the same format. Of the detector's type marks, types 1-2 are textual / parameterized similarity; types 3-4 are semantic and need embeddings.
+
+**Clustering.** Function pairs are merged into **clone families** as connected components — a≈b and b≈c makes {a,b,c} one family — and each family keeps its most similar pair as the representative. Clustering is purely structural: it trusts the detector's similarity output and does no semantic analysis of its own.
+
+**Judgement.** Each family goes to the session's model, which reads the **real source** (not the CSV snippets) to decide whether it is worth merging, at what priority, with evidence. A `patched` verdict additionally needs the user's `confirm: true` and the list of files it changed, and lands in the **authorization ledger** — the one list of "allowed changes" every later step consults, capped by `authorization.maxClusters` and `maxPriority`.
+
+**Verification.** Two stages: first a **reconciliation** of the real `git diff` against the ledger — any change outside it freezes the run with `UNAUTHORIZED_CHANGES`; then the **real build / test commands** you configured in `verify.steps` run, each step logging to disk. On failure the configured **partitioned rollback** restores the ledger's tracked files to the baseline and deletes the files this run created — never `git reset --hard`.
+
+**Submission.** Allowed only when the newest verification passed **and** the ledger, the cluster set and the scan revision are exactly what that attempt verified **and** its verify job succeeded; the commit uses `git commit --only`, so it contains **only the ledger's files**.
+
+**State.** All state lives in append-only files under the run directory (`clusters.jsonl`, the ledgers, `verify/N/`); the six tools never call each other and meet only through those files.
+
 ## Install
 
 ```sh
