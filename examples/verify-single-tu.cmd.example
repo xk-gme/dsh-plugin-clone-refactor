@@ -1,0 +1,12 @@
+@echo off
+rem Site verification for the clone-refactor plugin: compile the patched
+rem translation unit of GME module/base with MSVC. Exit code is the verdict.
+rem
+rem Adjust for your machine:
+rem   - the vcvars64.bat path (Visual Studio version),
+rem   - the target file and include dirs below,
+rem   - and reference this script from the plugin row:
+rem       verify.steps: [{ name: compile, phase: build, command: <this file> }]
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+cd /d D:\workspace\GME-shallow
+cl /nologo /c /std:c++17 /EHsc /I include /I module\base\include /Fo"%TEMP%\gme_verify_base.obj" module\base\src\vector.cpp

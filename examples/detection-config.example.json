@@ -1,0 +1,10 @@
+{
+  "gme_root": "D:/workspace/GME-shallow",
+  "output_root": "D:/workspace/gme-tools/detection-out",
+  "src_subdir": "src",
+  "project_name": "gme",
+  "include_dirs": ["D:/workspace/GME-shallow/include"],
+  "include_current_module_dir": true,
+  "libclang": { "file": "D:/workspace/gme-tools/venv-clone-detection/lib/site-packages/clang/native/libclang.dll", "path": "" },
+  "clone_detection": { "enabled": false }
+}

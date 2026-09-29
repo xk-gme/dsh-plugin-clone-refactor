@@ -151,7 +151,7 @@ A `verify.steps` entry is normalized field by field; an entry without a non-empt
 
 ### A worked GME profile
 
-The sample below is a complete, self-consistent starting point. The command lines are **site-specific and unverified here**: GME's real build and test invocations must be confirmed on your machine, which is what the checklist in section 12 is for. The angle-bracketed parts are command examples, not to-dos in the plugin.
+The sample below is a complete, self-consistent starting point. The command lines are **site-specific and unverified here**: GME's real build and test invocations must be confirmed on your machine, which is what the checklist in section 12 is for. The angle-bracketed parts are command examples, not to-dos in the plugin. A runnable site example — a detection-config JSON for the python-pipeline source and a single-translation-unit MSVC verify script — lives in [`examples/`](../examples/README.md) of this repository; copy it, replace the paths, and keep real site configuration out of the package.
 
 ```yaml
 - id: gme-clone-refactor
